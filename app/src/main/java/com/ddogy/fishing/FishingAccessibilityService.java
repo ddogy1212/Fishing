@@ -37,6 +37,10 @@ public class FishingAccessibilityService extends AccessibilityService {
     private static final String PREFS = "fishing_settings";
     private static final String WANTED = "user_requested_running";
     private static final long SCAN_TIMEOUT_MS = 9000;
+    private static final long STALL_MS = 3000; // no meaningful screen change
+    private static final long RECOVERY_COOLDOWN_MS = 9000;
+    private static final long GESTURE_TIMEOUT_MS = 4000;
+    private static final long SWIPE_SETTLE_MS = 450;
 
     private final Handler main = new Handler(Looper.getMainLooper());
     private final Random random = new Random();
@@ -47,6 +51,14 @@ public class FishingAccessibilityService extends AccessibilityService {
     private boolean running = false;
     private boolean working = false;
     private boolean seenChat = false;
+    private boolean gestureBusy = false;
+    private int gestureToken = 0;
+    private long gesturesCompleted = 0;
+    private long cancelledGestures = 0;
+    private long recoveryCount = 0;
+    private long lastRecoveryAt = -RECOVERY_COOLDOWN_MS;
+    private long lastVisualChangeAt = 0;
+    private int[] lastVisualSample;
     private long clicks = 0;
     private long lastTapAt = 0;
     private int scanToken = 0;
@@ -55,6 +67,13 @@ public class FishingAccessibilityService extends AccessibilityService {
     private long captureFailures = 0;
     private long unmatchedScans = 0;
     private String status = "준비 완료";
+
+    private final Runnable gestureWatchdog = () -> {
+        if (!running || !gestureBusy) return;
+        // Never start another gesture while the previous gesture's result
+        // is unknown. Wait for Android's callback or explicit user restart.
+        status = "터치/스크롤 응답 지연 — 앱을 확인해 주세요";
+    };
 
     private final Runnable watchdog = () -> {
         if (!running || !working) return;
@@ -100,6 +119,9 @@ public class FishingAccessibilityService extends AccessibilityService {
         scanToken++;
         main.removeCallbacks(ticker);
         main.removeCallbacks(watchdog);
+        main.removeCallbacks(gestureWatchdog);
+        gestureBusy = false;
+        gestureToken++;
         // A deliberate accessibility-service shutdown must not secretly
         // restart automation when the permission is re-enabled later.
         getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean(WANTED, false).apply();
@@ -116,6 +138,12 @@ public class FishingAccessibilityService extends AccessibilityService {
         seenChat = false;
         scanToken++;
         lastTapAt = 0;
+        lastVisualSample = null;
+        lastVisualChangeAt = 0;
+        lastRecoveryAt = -RECOVERY_COOLDOWN_MS;
+        gestureBusy = false;
+        gestureToken++;
+        main.removeCallbacks(gestureWatchdog);
         status = "카카오톡 낚시 채팅 화면으로 이동하세요";
         schedule(300);
     }
@@ -127,6 +155,11 @@ public class FishingAccessibilityService extends AccessibilityService {
         scanToken++;
         main.removeCallbacks(ticker);
         main.removeCallbacks(watchdog);
+        main.removeCallbacks(gestureWatchdog);
+        gestureBusy = false;
+        gestureToken++;
+        lastVisualSample = null;
+        lastVisualChangeAt = 0;
         status = "사용자가 중지했습니다";
     }
 
@@ -136,11 +169,13 @@ public class FishingAccessibilityService extends AccessibilityService {
     public long getTimeouts() { return scanTimeouts; }
     public long getCaptureFailures() { return captureFailures; }
     public long getUnmatchedScans() { return unmatchedScans; }
+    public long getRecoveryCount() { return recoveryCount; }
+    public long getCancelledGestures() { return cancelledGestures; }
     public String getCurrentStatus() { return status; }
 
     private void schedule(long ms) {
         main.removeCallbacks(ticker);
-        if (running) main.postDelayed(ticker, ms);
+        if (running && !gestureBusy) main.postDelayed(ticker, ms);
     }
 
     private long nextDelay() {
@@ -155,7 +190,7 @@ public class FishingAccessibilityService extends AccessibilityService {
     }
 
     private void scanOnce() {
-        if (!running || working) return;
+        if (!running || working || gestureBusy) return;
 
         AccessibilityNodeInfo root = getRootInActiveWindow();
         if (root == null || root.getPackageName() == null
@@ -218,7 +253,7 @@ public class FishingAccessibilityService extends AccessibilityService {
         if (token != scanToken) return;
         working = false;
         main.removeCallbacks(watchdog);
-        if (running) {
+        if (running && !gestureBusy) {
             if (retryWait > 0) schedule(retryWait);
             else nextCycle();
         }
@@ -237,6 +272,10 @@ public class FishingAccessibilityService extends AccessibilityService {
 
         task.addOnSuccessListener(result -> {
             if (!running || token != scanToken) return;
+            // Observe the chat region BEFORE performing any gesture. This
+            // catches lost taps: we still recover if taps were dispatched
+            // but the visual screen stayed unchanged for 3 seconds.
+            recordVisualChange(frame);
             Target fishing = findFishing(result, frame);
             // Accessibility nodes are a backup when OCR misses the '낚시' text.
             if (fishing == null) fishing = findFishingFromAccessibility(frame);
@@ -254,8 +293,17 @@ public class FishingAccessibilityService extends AccessibilityService {
                 }
             }
 
+            if (fishing != null) seenChat = true;
+
+            // Refresh the chat viewport only when a real chat was previously
+            // seen, the composer is visible, and the *screen* is stalled.
+            // Do not mix scroll gestures with fishing taps.
+            if (seenChat && chatComposer && shouldRecover()) {
+                beginRecovery(frame.getWidth(), frame.getHeight());
+                return;
+            }
+
             if (fishing != null) {
-                seenChat = true;
                 status = "낚시 버튼 인식 (" + fishing.side + ") — 터치";
                 tap(fishing.x, fishing.y, true);
                 return;
@@ -272,6 +320,91 @@ public class FishingAccessibilityService extends AccessibilityService {
             if (!frame.isRecycled()) frame.recycle();
             finishScan(token, 0);
         });
+    }
+
+    /**
+     * Track meaningful visual movement in the central chat area. Ignore the
+     * status bar, input caret, and most transient top/bottom UI elements.
+     * No screenshots or text are retained; only low-resolution color samples.
+     */
+    private void recordVisualChange(Bitmap frame) {
+        int w = frame.getWidth(), h = frame.getHeight();
+        int[] sample = new int[10 * 13];
+        int n = 0;
+        for (int iy = 0; iy < 13; iy++) {
+            int y = (int)(h * (0.26 + 0.55 * (iy + .5) / 13.0));
+            for (int ix = 0; ix < 10; ix++) {
+                int x = (int)(w * (0.12 + 0.76 * (ix + .5) / 10.0));
+                sample[n++] = frame.getPixel(x, y) & 0xFFFFFF;
+            }
+        }
+        long now = SystemClock.uptimeMillis();
+        boolean changed = lastVisualSample == null;
+        if (lastVisualSample != null) {
+            int changedPixels = 0;
+            for (int i = 0; i < sample.length; i++) {
+                int a = sample[i], b = lastVisualSample[i];
+                int difference = (Math.abs(Color.red(a) - Color.red(b))
+                    + Math.abs(Color.green(a) - Color.green(b))
+                    + Math.abs(Color.blue(a) - Color.blue(b))) / 3;
+                if (difference >= 20) changedPixels++;
+            }
+            changed = changedPixels >= 4;
+        }
+        if (changed || lastVisualChangeAt == 0) lastVisualChangeAt = now;
+        lastVisualSample = sample;
+    }
+
+    private boolean shouldRecover() {
+        long now = SystemClock.uptimeMillis();
+        return !gestureBusy
+            && lastVisualChangeAt > 0
+            && now - lastVisualChangeAt >= STALL_MS
+            && now - lastRecoveryAt >= RECOVERY_COOLDOWN_MS;
+    }
+
+    /**
+     * Scroll just enough to force re-layout of the chat, then reverse the
+     * scroll in a separate completed gesture. The chat input must be visible;
+     * a popup or another app never triggers this operation.
+     */
+    private void beginRecovery(int w, int h) {
+        if (!running || gestureBusy || !isKakaoChat()) return;
+        lastRecoveryAt = SystemClock.uptimeMillis();
+        recoveryCount++;
+        int x = Math.round(w * .80f);
+        int centerY = Math.round(h * .54f);
+        int delta = Math.max(110, Math.min(170, Math.round(h * .11f)));
+        int upperY = centerY - delta / 2;
+        int lowerY = centerY + delta / 2;
+        status = "화면 3초 정지 → 위로 스크롤 (" + recoveryCount + ")";
+        swipe(x, lowerY, upperY, () -> {
+            if (!running || !isKakaoChat()) return;
+            main.postDelayed(() -> {
+                if (!running || !isKakaoChat() || gestureBusy) return;
+                status = "스크롤 완료 → 아래로 복귀";
+                swipe(x, upperY, lowerY, () -> {
+                    lastVisualSample = null; // force new screen baseline
+                    lastVisualChangeAt = SystemClock.uptimeMillis();
+                    status = "스크롤 복귀 완료 → 낚시 버튼 재인식";
+                    schedule(550);
+                });
+            }, SWIPE_SETTLE_MS);
+        });
+    }
+
+    private boolean isKakaoChat() {
+        AccessibilityNodeInfo root = getRootInActiveWindow();
+        return root != null && root.getPackageName() != null
+            && KAKAO_PACKAGE.contentEquals(root.getPackageName())
+            && containsChatComposer(root);
+    }
+
+    private void swipe(int x, int fromY, int toY, Runnable onCompleted) {
+        Path path = new Path();
+        path.moveTo(x, fromY);
+        path.lineTo(x, toY);
+        dispatchSingleGesture(path, 240, false, onCompleted);
     }
 
     /** The OCR *element* must exactly be 낚시, not a larger message like 낚시터. */
@@ -523,31 +656,72 @@ public class FishingAccessibilityService extends AccessibilityService {
     }
 
     private void tap(int x, int y, boolean fishing) {
-        if (!running) return;
+        Path path = new Path();
+        path.moveTo(x, y);
+        dispatchSingleGesture(path, 80, fishing, null);
+    }
+
+    /**
+     * Serialize all taps and scrolls. An earlier gesture MUST complete before
+     * another starts. This prevents Android cancelling one overlapping stroke.
+     */
+    private void dispatchSingleGesture(Path path, long durationMs,
+            boolean fishingTap, Runnable continuation) {
+        if (!running || gestureBusy) return;
         AccessibilityNodeInfo root = getRootInActiveWindow();
         if (root == null || root.getPackageName() == null
                 || !KAKAO_PACKAGE.contentEquals(root.getPackageName())) return;
 
-        Path path = new Path();
-        path.moveTo(x, y);
-        GestureDescription.StrokeDescription stroke =
-            new GestureDescription.StrokeDescription(path, 0, 80);
+        int id = ++gestureToken;
+        gestureBusy = true;
+        main.removeCallbacks(ticker);
         GestureDescription gesture = new GestureDescription.Builder()
-            .addStroke(stroke).build();
-        boolean dispatched = dispatchGesture(gesture,
-            new GestureResultCallback() {
+            .addStroke(new GestureDescription.StrokeDescription(path, 0, durationMs)).build();
+        try {
+            boolean dispatched = dispatchGesture(gesture, new GestureResultCallback() {
                 @Override public void onCompleted(GestureDescription gd) {
-                    if (running) status = fishing ? "낚시 완료, 다음 인식 대기" : "닫기 완료, 채팅 복귀 확인 중";
+                    if (id != gestureToken) return;
+                    gestureBusy = false;
+                    main.removeCallbacks(gestureWatchdog);
+                    gesturesCompleted++;
+                    if (!running) return;
+                    if (fishingTap) {
+                        lastTapAt = SystemClock.uptimeMillis();
+                        clicks++;
+                        status = "낚시 터치 완료 → 다음 인식 대기";
+                    } else if (continuation == null) {
+                        lastTapAt = SystemClock.uptimeMillis();
+                        status = "팝업 닫기 완료 → 재탐색";
+                    }
+                    if (continuation != null) continuation.run();
+                    else nextCycle();
                 }
+
                 @Override public void onCancelled(GestureDescription gd) {
-                    if (running) status = "터치 취소됨";
+                    if (id != gestureToken) return;
+                    gestureBusy = false;
+                    main.removeCallbacks(gestureWatchdog);
+                    cancelledGestures++;
+                    if (running) {
+                        status = "제스처 취소됨 — 재탐색 (" + cancelledGestures + ")";
+                        schedule(900);
+                    }
                 }
             }, main);
-        if (dispatched) {
-            lastTapAt = SystemClock.uptimeMillis();
-            if (fishing) clicks++;
-        } else {
-            status = "터치 요청 실패";
+            if (!dispatched) {
+                gestureBusy = false;
+                cancelledGestures++;
+                status = "제스처 전송 실패 — 재시도";
+                schedule(850);
+            } else {
+                main.removeCallbacks(gestureWatchdog);
+                main.postDelayed(gestureWatchdog, GESTURE_TIMEOUT_MS);
+            }
+        } catch (Exception e) {
+            gestureBusy = false;
+            cancelledGestures++;
+            status = "제스처 예외 — 재시도";
+            schedule(1000);
         }
     }
 
