@@ -11,16 +11,24 @@ def releaseKeyPassword = System.getenv('FISHING_KEY_PASSWORD')
 def canSignRelease = [releaseKeystore, releaseStorePassword, releaseAlias,
                        releaseKeyPassword].every { it != null && !it.isEmpty() }
 
+// Optional independent app: ./gradlew assembleDebug -PfreshInstall=true
+// This is for SIDE-BY-SIDE installation, not to bypass Play Protect.
+def freshInstall = project.findProperty('freshInstall') == 'true'
+
 android {
     namespace 'com.ddogy.fishing'
     compileSdk 35
 
     defaultConfig {
-        applicationId 'com.ddogy.fishing'
+        applicationId freshInstall ? 'com.ddogy.fishing.fresh14' : 'com.ddogy.fishing'
         minSdk 30
         targetSdk 35
-        versionCode 6
+        versionCode freshInstall ? 1 : 6
         versionName '1.4.0'
+        manifestPlaceholders = [
+            appLabel: freshInstall ? 'Fishing 새 설치' : '@string/app_name',
+            accessibilityLabel: freshInstall ? 'Fishing 새 설치 도우미' : '@string/service_name'
+        ]
     }
 
     signingConfigs {
