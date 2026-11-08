@@ -23,6 +23,7 @@ public class MainActivity extends Activity {
     private TextView details;
     private Button start;
     private Button stop;
+    private Button manualReview;
 
     private final Runnable updater = new Runnable() {
         @Override public void run() {
@@ -110,9 +111,31 @@ public class MainActivity extends Activity {
         });
         layout.addView(stop);
 
+        manualReview = button("자동어 감지 · 게임 안내 확인 후 보호 정지 해제",
+            Color.rgb(146, 97, 32));
+        manualReview.setVisibility(View.GONE);
+        manualReview.setOnClickListener(v -> new AlertDialog.Builder(this)
+            .setTitle("자동어 안내 확인")
+            .setMessage("Fishing이 자동어를 발견하여 자동 클릭과 스크롤을 중단했습니다.\n\n"
+                + "게임 화면 안내에 따르면, 같은 상태에서 계속 낚시하면 자동어만 나옵니다. "
+                + "카카오톡 게임에서 안내하는 수동 전환은 직접 진행해야 합니다.\n\n"
+                + "게임 안내를 확인한 경우에만 보호 정지를 해제하세요. "
+                + "해제해도 자동 낚시는 다시 시작되지 않습니다.")
+            .setNegativeButton("보호 정지 유지", null)
+            .setPositiveButton("게임 안내 확인했어요", (dialog, which) -> {
+                FishingAccessibilityService current = FishingAccessibilityService.active;
+                if (current != null) current.acknowledgeManualReview();
+                refresh();
+            })
+            .show());
+        layout.addView(manualReview);
+
         TextView guide = text(
             "사용법\n\n① 접근성 권한에서 'Fishing 도우미' 허용\n② 자동 낚시 시작 누르기\n③ 카카오톡 낚시방으로 이동\n④ 멈출 때 이 앱으로 돌아와 중지\n\n" +
             "• 낚시 터치 간격: 2.1~2.3초 사이 랜덤(인식 지연 시 더 길 수 있음)\n" +
+            "• 자동어 안내를 발견하면 클릭과 스크롤을 즉시 중단\n" +
+            "• 게임의 수동 전환은 사용자가 직접 진행해야 함\n" +
+            "• 자동어 보호 정지는 앱 재시작 뒤에도 유지됨\n" +
             "• '낚시'라고 적힌 회색 버튼만 클릭\n" +
             "• 왼쪽/오른쪽 위치 자동 인식\n" +
             "• '자랑하기 / 놓아준다' 결과 카드만 보이면 이전 메시지로 이동해 낚시 버튼 검색\n" +
@@ -200,7 +223,10 @@ public class MainActivity extends Activity {
         FishingAccessibilityService service = FishingAccessibilityService.active;
         boolean enabled = service != null;
         boolean running = enabled && service.isRunning();
-        status.setText(!enabled ? "⚪ 접근성 권한을 켜 주세요" : running ? "🟢 실행 중" : "🟡 준비 완료 / 중지 상태");
+        boolean blocked = enabled && service.isAutoFishPaused();
+        status.setText(!enabled ? "⚪ 접근성 권한을 켜 주세요"
+            : blocked ? "⛔ 자동어 감지 · 보호 정지 중"
+            : running ? "🟢 실행 중" : "🟡 준비 완료 / 중지 상태");
         details.setText(!enabled
                 ? "Fishing 도우미가 비활성 상태입니다."
                 : "클릭 " + service.getClickCount() + "회 · 스캔 " + service.getScans() + "회\n" +
@@ -219,7 +245,8 @@ public class MainActivity extends Activity {
                   "개 · 확대 OCR " + service.getFocusedOcrAttempts() +
                   "회 · 확대 성공 " + service.getFocusedOcrMatches() + "회\n" +
                   "오인식 대기 복구 " + service.getBlockedGreyRowRecoveries() +
-                  "회 · 물고기 도둑 대응 " + service.getFishThiefRecoveries() + "회\n" +
+                  "회 · 물고기 도둑 대응 " + service.getFishThiefRecoveries() +
+                  "회 · 자동어 정지 " + service.getAutoFishNotices() + "회\n" +
                   "완료된 제스처 " + service.getSerializedGestures() +
                   "회 · OCR 후 대기 제스처 " + service.getDeferredGestureActions() + "회\n" +
                   "자동 멈춤 복구 " + service.getWatchdogRecoveries() + "회 · 마지막 간격 " +
@@ -227,8 +254,9 @@ public class MainActivity extends Activity {
                   service.getLastProgressAgeSeconds() + "초 전\n" +
                   "최근 복구 원인: " + service.getLastRecoveryReason() + "\n" +
                   service.getCurrentStatus() + "\n" + service.getRecentEvents());
-        start.setEnabled(enabled && !running);
-        start.setAlpha(enabled && !running ? 1f : 0.5f);
+        start.setEnabled(enabled && !running && !blocked);
+        start.setAlpha(enabled && !running && !blocked ? 1f : 0.5f);
+        manualReview.setVisibility(blocked ? View.VISIBLE : View.GONE);
         stop.setEnabled(running);
         stop.setAlpha(running ? 1f : 0.5f);
     }
