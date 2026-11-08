@@ -654,7 +654,9 @@ public class FishingAccessibilityService extends AccessibilityService {
         if (grey(image, x + dx, y)) matches++;
         if (grey(image, x, y - dy)) matches++;
         if (grey(image, x, y + dy)) matches++;
-        return matches >= 3;
+        // OCR text boxes can cover some of the gray button. Two clear
+        // background samples plus the exact word are sufficient here.
+        return matches >= 2;
     }
 
     private boolean grey(Bitmap image, int x, int y) {
