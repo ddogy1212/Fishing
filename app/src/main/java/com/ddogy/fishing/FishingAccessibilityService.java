@@ -52,7 +52,9 @@ public class FishingAccessibilityService extends AccessibilityService {
     private boolean working = false;
     private boolean seenChat = false;
     private boolean gestureBusy = false;
+    private boolean recovering = false;
     private int gestureToken = 0;
+    private int sessionToken = 0;
     private long gesturesCompleted = 0;
     private long cancelledGestures = 0;
     private long recoveryCount = 0;
@@ -70,9 +72,15 @@ public class FishingAccessibilityService extends AccessibilityService {
 
     private final Runnable gestureWatchdog = () -> {
         if (!running || !gestureBusy) return;
-        // Never start another gesture while the previous gesture's result
-        // is unknown. Wait for Android's callback or explicit user restart.
-        status = "터치/스크롤 응답 지연 — 앱을 확인해 주세요";
+        // Even if Android drops a gesture callback, its 80–240 ms stroke
+        // cannot still be active several seconds later. Invalidate any
+        // delayed callback and recover the scanning loop.
+        gestureToken++;
+        gestureBusy = false;
+        recovering = false;
+        cancelledGestures++;
+        status = "제스처 응답 지연 → 안전 재탐색";
+        schedule(950);
     };
 
     private final Runnable watchdog = () -> {
@@ -121,7 +129,9 @@ public class FishingAccessibilityService extends AccessibilityService {
         main.removeCallbacks(watchdog);
         main.removeCallbacks(gestureWatchdog);
         gestureBusy = false;
+        recovering = false;
         gestureToken++;
+        sessionToken++;
         // A deliberate accessibility-service shutdown must not secretly
         // restart automation when the permission is re-enabled later.
         getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean(WANTED, false).apply();
@@ -142,7 +152,9 @@ public class FishingAccessibilityService extends AccessibilityService {
         lastVisualChangeAt = 0;
         lastRecoveryAt = -RECOVERY_COOLDOWN_MS;
         gestureBusy = false;
+        recovering = false;
         gestureToken++;
+        sessionToken++;
         main.removeCallbacks(gestureWatchdog);
         status = "카카오톡 낚시 채팅 화면으로 이동하세요";
         schedule(300);
@@ -157,7 +169,9 @@ public class FishingAccessibilityService extends AccessibilityService {
         main.removeCallbacks(watchdog);
         main.removeCallbacks(gestureWatchdog);
         gestureBusy = false;
+        recovering = false;
         gestureToken++;
+        sessionToken++;
         lastVisualSample = null;
         lastVisualChangeAt = 0;
         status = "사용자가 중지했습니다";
@@ -175,7 +189,7 @@ public class FishingAccessibilityService extends AccessibilityService {
 
     private void schedule(long ms) {
         main.removeCallbacks(ticker);
-        if (running && !gestureBusy) main.postDelayed(ticker, ms);
+        if (running && !gestureBusy && !recovering) main.postDelayed(ticker, ms);
     }
 
     private long nextDelay() {
@@ -190,7 +204,7 @@ public class FishingAccessibilityService extends AccessibilityService {
     }
 
     private void scanOnce() {
-        if (!running || working || gestureBusy) return;
+        if (!running || working || gestureBusy || recovering) return;
 
         AccessibilityNodeInfo root = getRootInActiveWindow();
         if (root == null || root.getPackageName() == null
@@ -253,7 +267,7 @@ public class FishingAccessibilityService extends AccessibilityService {
         if (token != scanToken) return;
         working = false;
         main.removeCallbacks(watchdog);
-        if (running && !gestureBusy) {
+        if (running && !gestureBusy && !recovering) {
             if (retryWait > 0) schedule(retryWait);
             else nextCycle();
         }
@@ -369,7 +383,9 @@ public class FishingAccessibilityService extends AccessibilityService {
      * a popup or another app never triggers this operation.
      */
     private void beginRecovery(int w, int h) {
-        if (!running || gestureBusy || !isKakaoChat()) return;
+        if (!running || gestureBusy || recovering || !isKakaoChat()) return;
+        recovering = true;
+        int session = sessionToken;
         lastRecoveryAt = SystemClock.uptimeMillis();
         recoveryCount++;
         int x = Math.round(w * .80f);
@@ -379,12 +395,19 @@ public class FishingAccessibilityService extends AccessibilityService {
         int lowerY = centerY + delta / 2;
         status = "화면 3초 정지 → 위로 스크롤 (" + recoveryCount + ")";
         swipe(x, lowerY, upperY, () -> {
-            if (!running || !isKakaoChat()) return;
+            if (!running || session != sessionToken) return;
             main.postDelayed(() -> {
-                if (!running || !isKakaoChat() || gestureBusy) return;
+                if (!running || session != sessionToken || gestureBusy) return;
+                if (!isKakaoChat()) {
+                    recovering = false;
+                    schedule(900);
+                    return;
+                }
                 status = "스크롤 완료 → 아래로 복귀";
                 swipe(x, upperY, lowerY, () -> {
-                    lastVisualSample = null; // force new screen baseline
+                    if (session != sessionToken) return;
+                    recovering = false;
+                    lastVisualSample = null; // fresh baseline after returning
                     lastVisualChangeAt = SystemClock.uptimeMillis();
                     status = "스크롤 복귀 완료 → 낚시 버튼 재인식";
                     schedule(550);
@@ -702,6 +725,7 @@ public class FishingAccessibilityService extends AccessibilityService {
                     gestureBusy = false;
                     main.removeCallbacks(gestureWatchdog);
                     cancelledGestures++;
+                    recovering = false;
                     if (running) {
                         status = "제스처 취소됨 — 재탐색 (" + cancelledGestures + ")";
                         schedule(900);
@@ -710,6 +734,7 @@ public class FishingAccessibilityService extends AccessibilityService {
             }, main);
             if (!dispatched) {
                 gestureBusy = false;
+                recovering = false;
                 cancelledGestures++;
                 status = "제스처 전송 실패 — 재시도";
                 schedule(850);
@@ -719,6 +744,7 @@ public class FishingAccessibilityService extends AccessibilityService {
             }
         } catch (Exception e) {
             gestureBusy = false;
+            recovering = false;
             cancelledGestures++;
             status = "제스처 예외 — 재시도";
             schedule(1000);
