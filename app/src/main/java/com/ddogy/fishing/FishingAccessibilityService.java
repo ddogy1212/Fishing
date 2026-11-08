@@ -45,8 +45,8 @@ public class FishingAccessibilityService extends AccessibilityService {
     private static final long RETRY_OLDER_COOLDOWN_MS = 9000;
     private static final long SESSION_WATCHDOG_MS = 12500;
     private static final long HEARTBEAT_INTERVAL_MS = 2500;
-    private static final int MIN_FISH_TAP_INTERVAL_MS = 1800;
-    private static final int MAX_FISH_TAP_INTERVAL_MS = 2200;
+    private static final int MIN_FISH_TAP_INTERVAL_MS = 2100;
+    private static final int MAX_FISH_TAP_INTERVAL_MS = 2300;
     // A view must have been reached directly after an observed Kakao chat.
     private static final long TRUSTED_VIEW_WINDOW_MS = 20000;
     private static final long EXIT_RETRY_COOLDOWN_MS = 1800;
@@ -1322,7 +1322,7 @@ public class FishingAccessibilityService extends AccessibilityService {
                                     returnToLatest(steps);
                             }, 600);
                         } else {
-                            // Not 1.8 seconds from this callback: the timing
+                            // Not from this callback: the timing
                             // guard is anchored at the actual dispatch time.
                             schedule(250);
                         }
