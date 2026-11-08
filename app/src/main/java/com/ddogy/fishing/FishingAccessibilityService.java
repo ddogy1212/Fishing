@@ -369,8 +369,14 @@ public class FishingAccessibilityService extends AccessibilityService {
     /** Check an actual grey rounded-button background around the OCR letters. */
     private boolean looksLikeGreyButton(Bitmap frame, Rect letters) {
         int cx = letters.centerX(), cy = letters.centerY();
-        int gapX = Math.max(letters.width(), Math.round(letters.height() * 1.25f));
-        int gapY = Math.max(10, Math.round(letters.height() * 0.83f));
+        // OCR gives narrow text bounds, while accessibility sometimes gives
+        // the entire wide button. Sample *inside* either kind of bounds.
+        int gapX = letters.width() > 95
+            ? Math.min(52, letters.width() / 4)
+            : Math.max(letters.width(), Math.round(letters.height() * 1.25f));
+        int gapY = letters.height() > 48
+            ? Math.max(12, letters.height() / 4)
+            : Math.max(10, Math.round(letters.height() * 0.83f));
         int matched = 0;
 
         if (grey(frame, cx - gapX, cy)) matched++;
