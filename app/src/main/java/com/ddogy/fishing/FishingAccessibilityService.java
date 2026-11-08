@@ -45,8 +45,12 @@ public class FishingAccessibilityService extends AccessibilityService {
     private static final long RETRY_OLDER_COOLDOWN_MS = 9000;
     private static final long SESSION_WATCHDOG_MS = 12500;
     private static final long HEARTBEAT_INTERVAL_MS = 2500;
-    private static final int MIN_FISH_TAP_INTERVAL_MS = 2000;
+    private static final int MIN_FISH_TAP_INTERVAL_MS = 1800;
     private static final int MAX_FISH_TAP_INTERVAL_MS = 2200;
+    // A view must have been reached directly after an observed Kakao chat.
+    private static final long TRUSTED_VIEW_WINDOW_MS = 20000;
+    private static final long EXIT_RETRY_COOLDOWN_MS = 1800;
+    private static final int MAX_EXIT_ATTEMPTS_PER_VIEW = 3;
     private static final int MAX_OLDER_SWIPES = 3;
     private final Handler main = new Handler(Looper.getMainLooper());
     private final Random random = new Random();
@@ -69,6 +73,11 @@ public class FishingAccessibilityService extends AccessibilityService {
     private long lastFishingDispatchAt;
     private long nextFishingTapEligibleAt;
     private long lastChosenTapIntervalMs;
+    private long lastChatSeenAt;
+    private long lastExitAttemptAt = -EXIT_RETRY_COOLDOWN_MS;
+    private int viewExitAttempts;
+    private long rescuedPhotoViews;
+    private long rescuedWebViews;
     private long noButtonSince;
     private long lastSeekAt = -RETRY_OLDER_COOLDOWN_MS;
     private long lastVisualChangeAt;
@@ -142,6 +151,8 @@ public class FishingAccessibilityService extends AccessibilityService {
     public long getWatchdogRecoveries() { return watchdogRecoveries; }
     public String getLastRecoveryReason() { return lastRecoveryReason; }
     public long getLastChosenTapIntervalMs() { return lastChosenTapIntervalMs; }
+    public long getRescuedPhotoViews() { return rescuedPhotoViews; }
+    public long getRescuedWebViews() { return rescuedWebViews; }
 
     /**
      * Detect older installs of THIS project that may run a second
@@ -255,6 +266,9 @@ public class FishingAccessibilityService extends AccessibilityService {
         nextFishingTapEligibleAt = 0;
         lastFishingDispatchAt = 0;
         lastChosenTapIntervalMs = 0;
+        lastChatSeenAt = 0;
+        viewExitAttempts = 0;
+        lastExitAttemptAt = -EXIT_RETRY_COOLDOWN_MS;
         recordProgress();
         main.removeCallbacks(heartbeat);
         main.postDelayed(heartbeat, HEARTBEAT_INTERVAL_MS);
@@ -276,6 +290,8 @@ public class FishingAccessibilityService extends AccessibilityService {
         returningToLatest = false;
         noButtonSince = 0;
         lastVisualSample = null;
+        lastChatSeenAt = 0;
+        viewExitAttempts = 0;
         main.removeCallbacks(ticker);
         main.removeCallbacks(scanTimeout);
         main.removeCallbacks(tapTimeout);
@@ -302,6 +318,107 @@ public class FishingAccessibilityService extends AccessibilityService {
             // Scan OCR again when the next tap becomes eligible.
             long remaining = nextFishingTapEligibleAt - SystemClock.uptimeMillis();
             main.postDelayed(ticker, Math.max(delayMs, Math.max(0, remaining)));
+        }
+    }
+
+    private String foregroundPackage() {
+        AccessibilityNodeInfo root = getRootInActiveWindow();
+        if (root == null || root.getPackageName() == null) return "";
+        return root.getPackageName().toString();
+    }
+
+    private boolean isTrustedGalleryPackage(String packageName) {
+        // Samsung Gallery and Google Photos are only supported if they
+        // became foreground immediately after a verified Kakao chat.
+        return "com.sec.android.gallery3d".equals(packageName)
+            || "com.samsung.android.gallery3d".equals(packageName)
+            || "com.google.android.apps.photos".equals(packageName);
+    }
+
+    private boolean recentlyInKakaoChat() {
+        long now = SystemClock.uptimeMillis();
+        return lastChatSeenAt > 0
+            && now - lastChatSeenAt <= TRUSTED_VIEW_WINDOW_MS;
+    }
+
+    /** Exit a known viewer without touching arbitrary app content. */
+    private boolean goBackFromTrustedView(String reason) {
+        if (!running || !recentlyInKakaoChat() || tapping) return false;
+        long now = SystemClock.uptimeMillis();
+        if (viewExitAttempts >= MAX_EXIT_ATTEMPTS_PER_VIEW) {
+            status = "복귀 3회 실패 → 잘못된 화면 조작 방지를 위해 중지";
+            return false;
+        }
+        if (now - lastExitAttemptAt < EXIT_RETRY_COOLDOWN_MS) {
+            status = reason + " → 복귀 결과 확인 중";
+            return false;
+        }
+        lastExitAttemptAt = now;
+        viewExitAttempts++;
+        // Global BACK (the user's requested back button) is safer than
+        // guessing an unlabeled picture, menu or ad close coordinate.
+        boolean ok = performGlobalAction(GLOBAL_ACTION_BACK);
+        if (!ok) ok = clickKnownUpperLeftBack();
+        if (ok) {
+            if (reason.contains("사진")) rescuedPhotoViews++;
+            else rescuedWebViews++;
+            recordEvent("복귀 시도: " + reason + " (" + viewExitAttempts + ")");
+            status = reason + " → 뒤로가기로 채팅 복귀 확인";
+            olderSwipes = 0;
+            returningToLatest = false;
+            noButtonSince = 0;
+            lastVisualSample = null;
+            recordProgress();
+        } else {
+            status = reason + " → 뒤로가기 실패, 확인 필요";
+        }
+        return ok;
+    }
+
+    /**
+     * Only click a top-left Back/Close accessibility node in a trusted
+     * viewer, and only if Android's normal BACK action was rejected.
+     */
+    private boolean clickKnownUpperLeftBack() {
+        AccessibilityNodeInfo root = getRootInActiveWindow();
+        if (root == null) return false;
+        int w = getResources().getDisplayMetrics().widthPixels;
+        int h = getResources().getDisplayMetrics().heightPixels;
+        ArrayDeque<AccessibilityNodeInfo> nodes = new ArrayDeque<>();
+        nodes.add(root);
+        int count = 0;
+        while (!nodes.isEmpty() && count++ < 500) {
+            AccessibilityNodeInfo node = nodes.removeFirst();
+            Rect r = new Rect();
+            node.getBoundsInScreen(r);
+            String label = ((node.getContentDescription() == null ? ""
+                : node.getContentDescription().toString()) + " "
+                + (node.getText() == null ? "" : node.getText().toString()))
+                .trim().toLowerCase(java.util.Locale.ROOT);
+            boolean expected = label.equals("뒤로") || label.equals("뒤로 가기")
+                || label.equals("이전") || label.equals("닫기")
+                || label.equals("navigate up") || label.equals("back")
+                || label.equals("close");
+            if (expected && node.isVisibleToUser()
+                && r.centerX() > w * .015 && r.centerX() < w * .22
+                && r.centerY() > h * .025 && r.centerY() < h * .19
+                && node.isClickable() && node.performAction(
+                    AccessibilityNodeInfo.ACTION_CLICK)) {
+                return true;
+            }
+            for (int i = 0; i < node.getChildCount(); i++) {
+                AccessibilityNodeInfo child = node.getChild(i);
+                if (child != null) nodes.add(child);
+            }
+        }
+        return false;
+    }
+
+    private void observedChat() {
+        lastChatSeenAt = SystemClock.uptimeMillis();
+        if (viewExitAttempts > 0) {
+            viewExitAttempts = 0;
+            recordEvent("채팅 복귀 확인");
         }
     }
 
@@ -343,11 +460,17 @@ public class FishingAccessibilityService extends AccessibilityService {
             stopRunning();
             return;
         }
-        if (!onKakao()) {
-            status = "카카오톡 화면 대기 중";
-            schedule(950);
+        String currentPackage = foregroundPackage();
+        if (!KAKAO.equals(currentPackage)) {
+            if (isTrustedGalleryPackage(currentPackage) && recentlyInKakaoChat()) {
+                goBackFromTrustedView("외부 사진 뷰어");
+            } else {
+                status = "카카오톡 화면 대기 중";
+            }
+            schedule(900);
             return;
         }
+        if (visibleKakaoChat()) observedChat();
 
         scanning = true;
         scans++;
@@ -411,17 +534,22 @@ public class FishingAccessibilityService extends AccessibilityService {
         task.addOnSuccessListener(text -> {
             if (!running || id != scanToken) return;
             boolean inChat = visibleKakaoChat();
+            // Page identity takes precedence: an in-app web search field can
+            // appear editable and otherwise look like a chat composer.
+            if (isFishingWebsite(text, image.getHeight()) && !hasKakaoChatComposer()) {
+                status = "낚시 웹페이지 감지 → 닫기/뒤로가기";
+                closeFishingWebsite(text, image);
+                return;
+            }
             if (!inChat) {
-                // Do not tap or swipe an unknown window. This specific site
-                // is opened by the fishing bot; returning to chat is expected.
-                if (isFishingWebsite(text)) {
-                    status = "낚시 웹페이지 감지 → 채팅 복귀";
-                    closeFishingWebsite(text, image);
+                if (isKakaoPhotoViewer(text)) {
+                    goBackFromTrustedView("카카오톡 사진 보기");
                 } else {
-                    status = "카카오톡 낚시 채팅방 복귀 대기";
+                    status = "채팅이 아닌 화면 감지 → 안전 대기";
                 }
                 return;
             }
+            observedChat();
 
             recordVisualFrame(image);
             Target target = findFishing(text, image);
@@ -516,11 +644,47 @@ public class FishingAccessibilityService extends AccessibilityService {
         return brag && release;
     }
 
-    private boolean isFishingWebsite(Text recognized) {
+    /** Strong signal from the photo viewer screenshot, not arbitrary text. */
+    private boolean isKakaoPhotoViewer(Text recognized) {
+        StringBuilder all = new StringBuilder();
+        for (Text.TextBlock b : recognized.getTextBlocks()) all.append(b.getText()).append(" ");
+        String normalized = all.toString().replace(" ", "");
+        return normalized.contains("AI로만들기")
+            && (normalized.contains("삭제") || normalized.contains("공유")
+                || normalized.contains("다운로드") || normalized.contains("오후")
+                || normalized.contains("오전"));
+    }
+
+    /** Avoid interpreting a webpage text input as a Kakao message composer. */
+    private boolean hasKakaoChatComposer() {
+        AccessibilityNodeInfo root = getRootInActiveWindow();
+        if (root == null || root.getPackageName() == null
+            || !KAKAO.contentEquals(root.getPackageName())) return false;
+        ArrayDeque<AccessibilityNodeInfo> queue = new ArrayDeque<>();
+        queue.add(root);
+        int count = 0;
+        while (!queue.isEmpty() && count++ < 500) {
+            AccessibilityNodeInfo node = queue.removeFirst();
+            CharSequence label = node.getText();
+            CharSequence desc = node.getContentDescription();
+            if ((label != null && label.toString().contains("메시지 입력"))
+                || (desc != null && desc.toString().contains("메시지 입력"))) return true;
+            for (int i = 0; i < node.getChildCount(); i++) {
+                AccessibilityNodeInfo child = node.getChild(i);
+                if (child != null) queue.add(child);
+            }
+        }
+        return false;
+    }
+
+    private boolean isFishingWebsite(Text recognized, int screenHeight) {
         for (Text.TextBlock b : recognized.getTextBlocks()) {
             String s = b.getText().toLowerCase(java.util.Locale.ROOT);
-            if (s.contains("couchfisher.com")
-                || s.contains("카카오톡으로 돌아가면")
+            Rect r = b.getBoundingBox();
+            boolean inBrowserHeader = r != null
+                && r.centerY() < screenHeight * .18;
+            if ((inBrowserHeader && s.contains("couchfisher.com"))
+                || s.contains("카카오톡으로 돌아가면 낚시를 계속")
                 || s.contains("낚시를 계속할 수 있어요")) return true;
         }
         return false;
@@ -528,24 +692,24 @@ public class FishingAccessibilityService extends AccessibilityService {
 
     /** Only operate on a positively recognized fishing website inside Kakao. */
     private void closeFishingWebsite(Text text, Bitmap image) {
-        if (!running || !onKakao() || visibleKakaoChat()) return;
+        if (!running || !onKakao()) return;
+        if (!recentlyInKakaoChat()) {
+            status = "웹 복귀: 최근 채팅 기록 없음 → 안전 대기";
+            return;
+        }
+        // The top-level Kakao in-app browser X is preferred over an
+        // inside-page popup X, which only closes the internal popup.
         Target close = findWebCloseFromNodes(image.getWidth(), image.getHeight());
         if (close == null) close = findWebCloseFromOcr(text, image);
         if (close == null) close = findWebClosePixels(image);
-        if (close != null) {
+        if (close != null && viewExitAttempts == 0) {
+            viewExitAttempts++;
+            lastExitAttemptAt = SystemClock.uptimeMillis();
             final int x = close.x, y = close.y;
-            dispatchAction(x, y, x, y, 80, Action.CLOSE, null);
+            boolean sent = dispatchAction(x, y, x, y, 80, Action.CLOSE, null);
+            if (!sent) goBackFromTrustedView("낚시 웹페이지");
         } else {
-            // Back is only used for a recognized in-app fishing website.
-            if (performGlobalAction(GLOBAL_ACTION_BACK)) {
-                popupsClosed++;
-                olderSwipes = 0;
-                noButtonSince = 0;
-                lastVisualSample = null;
-                status = "낚시 웹페이지 뒤로가기 완료";
-            } else {
-                status = "웹페이지 닫기 실패 → 다시 확인";
-            }
+            goBackFromTrustedView("낚시 웹페이지");
         }
     }
 
