@@ -42,7 +42,7 @@ public class FishingAccessibilityService extends AccessibilityService {
     private static final int OCR_TIMEOUT_MS = 9000;
     private static final int GESTURE_TIMEOUT_MS = 4000;
     private static final long STALL_MS = 3000;
-    private static final long RETRY_OLDER_COOLDOWN_MS = 9000;
+    private static final long RETRY_OLDER_COOLDOWN_MS = 20000;
     private static final long SESSION_WATCHDOG_MS = 12500;
     private static final long HEARTBEAT_INTERVAL_MS = 2500;
     private static final long SCROLL_SETTLE_MS = 650;
@@ -85,6 +85,9 @@ public class FishingAccessibilityService extends AccessibilityService {
     private long blockedTextCandidates;
     private long visualPairFallbacks;
     private long mergedOcrPairs;
+    private long focusedOcrAttempts;
+    private long focusedOcrMatches;
+    private long verifiedGreyPairRows;
     private long lastRevealAt = -REVEAL_RETRY_MS;
     private int revealSwipes;
     private long noButtonSince;
@@ -172,6 +175,9 @@ public class FishingAccessibilityService extends AccessibilityService {
     public long getBlockedTextCandidates() { return blockedTextCandidates; }
     public long getVisualPairFallbacks() { return visualPairFallbacks; }
     public long getMergedOcrPairs() { return mergedOcrPairs; }
+    public long getFocusedOcrAttempts() { return focusedOcrAttempts; }
+    public long getFocusedOcrMatches() { return focusedOcrMatches; }
+    public long getVerifiedGreyPairRows() { return verifiedGreyPairRows; }
     public long getSerializedGestures() { return serializedGestures; }
     public long getDeferredGestureActions() { return deferredGestureActions; }
 
@@ -570,19 +576,15 @@ public class FishingAccessibilityService extends AccessibilityService {
             finishScan(id, 1200);
             return;
         }
-
+        final boolean[] focusedPending = {false};
         task.addOnSuccessListener(text -> {
             if (!running || id != scanToken) return;
             boolean inChat = visibleKakaoChat();
-            // Page identity takes precedence: an in-app web search field can
-            // appear editable and otherwise look like a chat composer.
             if (isFishingWebsite(text, image.getHeight()) && !hasKakaoChatComposer()) {
                 status = "낚시 웹페이지 감지 → 닫기/뒤로가기";
                 deferScanAction(id, () -> closeFishingWebsite(text, image));
                 return;
             }
-            // The Kakao photo viewer can expose old chat edit fields
-            // behind its overlay. Positive viewer evidence takes priority.
             if (isKakaoPhotoViewer(text, image.getHeight())) {
                 deferScanAction(id, () -> goBackFromTrustedView("카카오톡 사진 보기"));
                 return;
@@ -595,84 +597,249 @@ public class FishingAccessibilityService extends AccessibilityService {
 
             recordVisualFrame(image);
             int composerTop = findComposerTop(image.getHeight());
-            // Always consider BOTH sources. If two fishing buttons are
-            // present, the lowest visible one is the newest message.
             Target ocrTarget = findFishing(text, image, composerTop);
             Target nodeTarget = findFishingFromNodes(image, composerTop);
             Target target;
             if (ocrTarget == null) target = nodeTarget;
             else if (nodeTarget == null) target = ocrTarget;
             else target = ocrTarget.y >= nodeTarget.y ? ocrTarget : nodeTarget;
-            long now = SystemClock.uptimeMillis();
 
             if (target != null) {
-                // A visible, verified fishing button ALWAYS wins over refresh
-                // or scrolling logic. The old 1.4 branch was scrolling
-                // even with a visible button; that caused an endless loop.
-                noButtonSince = 0;
-                revealSwipes = 0;
-                long remainingMs = nextFishingTapEligibleAt - now;
-                if (remainingMs > 0) {
-                    status = "낚시 버튼 발견 · 최소 터치 간격 대기 " + remainingMs + "ms";
-                    return;
-                }
-                status = "낚시 버튼 확인 (" + target.side + ") → 터치";
-                final int tapX = target.x, tapY = target.y;
-                deferScanAction(id, () -> tap(tapX, tapY));
+                acceptVerifiedFishingTarget(id, target);
                 return;
             }
 
-            missed++;
-
-            // Do not scroll away from a plausible button merely because
-            // the OCR missed the OTHER button in the row. Stay on the screen
-            // and rescan until it is positively verified or disappears.
-            if (hasVisibleGreyFishingCandidate(text, image, composerTop)) {
-                noButtonSince = now;
-                status = "회색 낚시 버튼 후보 발견 → 스크롤 대신 재인식";
+            // Only examine a proven pair of rectangular light-gray buttons.
+            // The user's video shows these even when full-screen Korean OCR
+            // fails. Crop and magnify each row BEFORE starting any scroll.
+            ArrayList<Integer> rows = detectGreyButtonRows(image, composerTop);
+            if (!rows.isEmpty()) {
+                verifiedGreyPairRows += rows.size();
+                focusedPending[0] = true;
+                status = "실제 회색 버튼 " + rows.size() + "줄 → 확대 재인식";
+                recognizeFocusedRows(image, text, rows, 0, id, composerTop);
                 return;
             }
-            if (noButtonSince == 0) noButtonSince = now;
-
-            // A result card is visible but its action row is underneath
-            // Kakao's fixed message composer. Scrolling to OLDER messages
-            // would make it worse: swipe UP (toward newer content) first.
-            if (shouldRevealBottomCard(text, image, composerTop)) {
-                if (revealSwipes < MAX_REVEAL_SWIPES
-                    && now - lastRevealAt >= REVEAL_RETRY_MS) {
-                    final int width = image.getWidth(), height = image.getHeight();
-                    deferScanAction(id, () -> revealBottomCard(width, height, composerTop));
-                } else {
-                    status = "하단 버튼이 입력창에 가려짐 → 재확인 중";
-                }
-                return;
-            }
-            boolean resultCard = hasResultChoices(text);
-            boolean shouldSeek = resultCard || olderSwipes > 0
-                || now - noButtonSince >= STALL_MS;
-            if (shouldSeek && (olderSwipes > 0
-                || now - lastSeekAt >= RETRY_OLDER_COOLDOWN_MS)) {
-                final int width = image.getWidth(), height = image.getHeight();
-                deferScanAction(id, () -> searchOlderButton(width, height));
-            } else {
-                status = resultCard
-                    ? "결과 카드 발견 → 이전 낚시 버튼 탐색 준비"
-                    : "낚시 버튼 미표시 → 화면 재검사";
-            }
+            handleNoFishingButton(text, image, id, composerTop, false);
         }).addOnFailureListener(error -> {
             if (running && id == scanToken) {
                 failures++;
                 status = "한글 인식 실패 → 재시도";
             }
-        }).addOnCompleteListener(t -> {
-            // Finish OCR first; deferred UI operations may briefly need
-            // these pixels to identify the right window/button.
-            try {
-                finishScan(id, 850);
-            } finally {
-                if (!image.isRecycled()) image.recycle();
-            }
+        }).addOnCompleteListener(done -> {
+            if (!focusedPending[0]) completeAndRecycle(image, id);
         });
+    }
+
+    private void completeAndRecycle(Bitmap image, int scanId) {
+        try {
+            finishScan(scanId, 850);
+        } finally {
+            if (!image.isRecycled()) image.recycle();
+        }
+    }
+
+    private void acceptVerifiedFishingTarget(int scanId, Target target) {
+        noButtonSince = 0;
+        revealSwipes = 0;
+        long remaining = nextFishingTapEligibleAt - SystemClock.uptimeMillis();
+        if (remaining > 0) {
+            status = "진짜 낚시 버튼 확인 → 클릭 간격 " + remaining + "ms 대기";
+            return;
+        }
+        status = "낚시 버튼 확인 (" + target.side + ") → 터치";
+        final int x = target.x, y = target.y;
+        deferScanAction(scanId, () -> tap(x, y));
+    }
+
+    /**
+     * Recognize complete rows of gray buttons without guessing their labels.
+     * A white vertical gutter separates two large gray rectangles. Checked
+     * against frames from the user's own screen recording.
+     */
+    private ArrayList<Integer> detectGreyButtonRows(Bitmap image, int composerTop) {
+        ArrayList<Integer> centers = new ArrayList<>();
+        int w = image.getWidth(), h = image.getHeight();
+        int lx = (int)(w * .30f), rx = (int)(w * .60f);
+        int gap = (int)(w * .446f);
+        int dx = (int)(w * .07f);
+        int last = -100, sum = 0, count = 0;
+        int limit = Math.min((int)(h * .865f), composerTop - 32);
+        for (int y = (int)(h * .148f); y < limit; y += 8) {
+            int lhs = 0, rhs = 0, whiteness = 0;
+            for (int sx : new int[]{-dx, dx}) {
+                for (int sy : new int[]{-13, 13}) {
+                    if (grey(image, lx + sx, y + sy)) lhs++;
+                    if (grey(image, rx + sx, y + sy)) rhs++;
+                }
+            }
+            for (int gx : new int[]{-8, 0, 8}) {
+                int x = gap + gx;
+                if (x < 1 || x >= w - 1) continue;
+                int c = image.getPixel(x, y);
+                if (Color.red(c) >= 250 && Color.green(c) >= 250
+                    && Color.blue(c) >= 250) whiteness++;
+            }
+            boolean row = lhs >= 3 && rhs >= 3 && whiteness >= 1;
+            if (row && (count == 0 || y - last <= 12)) {
+                sum += y; count++; last = y;
+            } else if (row) {
+                if (count >= 4) centers.add(sum / count);
+                sum = y; count = 1; last = y;
+            } else if (count > 0) {
+                if (count >= 4) centers.add(sum / count);
+                sum = 0; count = 0; last = -100;
+            }
+        }
+        if (count >= 4) centers.add(sum / count);
+        // Newest messages (lowest screen position) first.
+        java.util.Collections.sort(centers, java.util.Collections.reverseOrder());
+        if (centers.size() > 3)
+            return new ArrayList<>(centers.subList(0, 3));
+        return centers;
+    }
+
+    /**
+     * A second, magnified on-device OCR pass reads only the gray button row.
+     * It NEVER assumes the right button is "낚시": both buttons must be
+     * visually present and OCR must actually find that exact Korean label.
+     */
+    private void recognizeFocusedRows(Bitmap image, Text original,
+            ArrayList<Integer> rows, int index, int scanId, int composerTop) {
+        if (!running || scanId != scanToken) {
+            completeAndRecycle(image, scanId);
+            return;
+        }
+        if (index >= rows.size()) {
+            handleNoFishingButton(original, image, scanId, composerTop, true);
+            completeAndRecycle(image, scanId);
+            return;
+        }
+        final int w = image.getWidth(), h = image.getHeight(), y = rows.get(index);
+        int x0 = (int)(w * .14f), x1 = (int)(w * .77f);
+        int y0 = Math.max(0, y - 57), y1 = Math.min(h, y + 57);
+        Bitmap cut = null, scaled = null;
+        try {
+            cut = Bitmap.createBitmap(image, x0, y0, x1 - x0, y1 - y0);
+            scaled = Bitmap.createScaledBitmap(cut, (x1 - x0) * 2,
+                (y1 - y0) * 2, true);
+            cut.recycle();
+            cut = null;
+        } catch (Exception e) {
+            if (cut != null && !cut.isRecycled()) cut.recycle();
+            if (scaled != null && !scaled.isRecycled()) scaled.recycle();
+            recognizeFocusedRows(image, original, rows, index + 1, scanId, composerTop);
+            return;
+        }
+        final Bitmap focused = scaled;
+        final Target[] matched = {null};
+        focusedOcrAttempts++;
+        try {
+            recognizer.process(InputImage.fromBitmap(focused, 0))
+                .addOnSuccessListener(result -> {
+                    if (running && scanId == scanToken) {
+                        matched[0] = targetFromFocusedText(result, w, y, x0);
+                    }
+                })
+                .addOnFailureListener(error -> {
+                    if (running && scanId == scanToken)
+                        recordEvent("버튼 확대 OCR 실패");
+                })
+                .addOnCompleteListener(done -> {
+                    focused.recycle();
+                    if (!running || scanId != scanToken) {
+                        completeAndRecycle(image, scanId);
+                        return;
+                    }
+                    if (matched[0] != null) {
+                        focusedOcrMatches++;
+                        acceptVerifiedFishingTarget(scanId, matched[0]);
+                        completeAndRecycle(image, scanId);
+                    } else {
+                        recognizeFocusedRows(image, original, rows, index + 1,
+                            scanId, composerTop);
+                    }
+                });
+        } catch (Exception e) {
+            focused.recycle();
+            recognizeFocusedRows(image, original, rows, index + 1, scanId, composerTop);
+        }
+    }
+
+    private Target targetFromFocusedText(Text recognized, int fullWidth,
+            int rowY, int x0) {
+        int leftX = (int)(fullWidth * .30f);
+        int rightX = (int)(fullWidth * .60f);
+        for (Text.TextBlock block : recognized.getTextBlocks()) {
+            for (Text.Line line : block.getLines()) {
+                for (Text.Element word : line.getElements()) {
+                    if (!isFishing(word.getText())) continue;
+                    Rect b = word.getBoundingBox();
+                    if (b == null) continue;
+                    int actualX = x0 + b.centerX() / 2;
+                    if (Math.abs(actualX - leftX) <= fullWidth * .12f)
+                        return new Target(leftX, rowY, "왼쪽(확대 OCR)");
+                    if (Math.abs(actualX - rightX) <= fullWidth * .12f)
+                        return new Target(rightX, rowY, "오른쪽(확대 OCR)");
+                }
+                String merged = line.getText().replaceAll("[^가-힣]", "");
+                if (isFishing(merged) && line.getBoundingBox() != null) {
+                    int x = x0 + line.getBoundingBox().centerX() / 2;
+                    if (Math.abs(x - leftX) < Math.abs(x - rightX))
+                        return new Target(leftX, rowY, "왼쪽(확대 OCR)");
+                    return new Target(rightX, rowY, "오른쪽(확대 OCR)");
+                }
+                if (merged.matches("(대결|강화|자랑하기)낚시"))
+                    return new Target(rightX, rowY, "오른쪽(합쳐진 OCR)");
+                if (merged.matches("낚시(대결|강화|자랑하기)"))
+                    return new Target(leftX, rowY, "왼쪽(합쳐진 OCR)");
+            }
+        }
+        return null;
+    }
+
+    private void handleNoFishingButton(Text text, Bitmap image, int id,
+            int composerTop, boolean visibleGrayRows) {
+        if (!running || id != scanToken) return;
+        missed++;
+        long now = SystemClock.uptimeMillis();
+        boolean resultChoices = hasResultChoices(text);
+        // A visible 2-button row might be an OCR miss. Do not make the
+        // user's screen bounce while the button is plainly there.
+        if (visibleGrayRows && !resultChoices) {
+            noButtonSince = now;
+            status = "회색 버튼 줄 확인 → 글자 재검사, 스크롤 보류";
+            return;
+        }
+        if (hasVisibleGreyFishingCandidate(text, image, composerTop)) {
+            noButtonSince = now;
+            status = "회색 낚시 후보 → 스크롤 보류";
+            return;
+        }
+        if (noButtonSince == 0) noButtonSince = now;
+        if (shouldRevealBottomCard(text, image, composerTop)) {
+            if (revealSwipes < MAX_REVEAL_SWIPES
+                && now - lastRevealAt >= REVEAL_RETRY_MS) {
+                final int width = image.getWidth(), height = image.getHeight();
+                deferScanAction(id, () -> revealBottomCard(width, height, composerTop));
+            } else {
+                status = "가려진 버튼 표시 여부 다시 확인 중";
+            }
+            return;
+        }
+        // Only search older chat when a result card definitely has NO
+        // fishing action, or after a sustained empty-screen timeout.
+        boolean emptyForLongTime = now - noButtonSince >= 12000;
+        boolean shouldSeek = resultChoices || olderSwipes > 0 || emptyForLongTime;
+        if (shouldSeek && (olderSwipes > 0
+            || now - lastSeekAt >= RETRY_OLDER_COOLDOWN_MS)) {
+            final int width = image.getWidth(), height = image.getHeight();
+            deferScanAction(id, () -> searchOlderButton(width, height));
+        } else {
+            status = resultChoices
+                ? "결과 카드: 이전 메시지 탐색 대기"
+                : "낚시 버튼 없음 → 천천히 재확인";
+        }
     }
 
     private void deferScanAction(int scanId, Runnable action) {
