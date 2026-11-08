@@ -52,6 +52,8 @@ public class FishingAccessibilityService extends AccessibilityService {
     private static final long EXIT_RETRY_COOLDOWN_MS = 1800;
     private static final int MAX_EXIT_ATTEMPTS_PER_VIEW = 3;
     private static final int MAX_OLDER_SWIPES = 3;
+    private static final int MAX_REVEAL_SWIPES = 2;
+    private static final long REVEAL_RETRY_MS = 2200;
     private final Handler main = new Handler(Looper.getMainLooper());
     private final Random random = new Random();
     private final Runnable ticker = this::scanOnce;
@@ -78,6 +80,10 @@ public class FishingAccessibilityService extends AccessibilityService {
     private int viewExitAttempts;
     private long rescuedPhotoViews;
     private long rescuedWebViews;
+    private long revealedBottomButtons;
+    private long blockedTextCandidates;
+    private long lastRevealAt = -REVEAL_RETRY_MS;
+    private int revealSwipes;
     private long noButtonSince;
     private long lastSeekAt = -RETRY_OLDER_COOLDOWN_MS;
     private long lastVisualChangeAt;
@@ -153,6 +159,8 @@ public class FishingAccessibilityService extends AccessibilityService {
     public long getLastChosenTapIntervalMs() { return lastChosenTapIntervalMs; }
     public long getRescuedPhotoViews() { return rescuedPhotoViews; }
     public long getRescuedWebViews() { return rescuedWebViews; }
+    public long getRevealedBottomButtons() { return revealedBottomButtons; }
+    public long getBlockedTextCandidates() { return blockedTextCandidates; }
 
     /**
      * Detect older installs of THIS project that may run a second
@@ -269,6 +277,8 @@ public class FishingAccessibilityService extends AccessibilityService {
         lastChatSeenAt = 0;
         viewExitAttempts = 0;
         lastExitAttemptAt = -EXIT_RETRY_COOLDOWN_MS;
+        revealSwipes = 0;
+        lastRevealAt = -REVEAL_RETRY_MS;
         recordProgress();
         main.removeCallbacks(heartbeat);
         main.postDelayed(heartbeat, HEARTBEAT_INTERVAL_MS);
@@ -292,6 +302,7 @@ public class FishingAccessibilityService extends AccessibilityService {
         lastVisualSample = null;
         lastChatSeenAt = 0;
         viewExitAttempts = 0;
+        revealSwipes = 0;
         main.removeCallbacks(ticker);
         main.removeCallbacks(scanTimeout);
         main.removeCallbacks(tapTimeout);
@@ -556,8 +567,9 @@ public class FishingAccessibilityService extends AccessibilityService {
             if (hasKakaoChatComposer()) observedChat();
 
             recordVisualFrame(image);
-            Target target = findFishing(text, image);
-            if (target == null) target = findFishingFromNodes(image);
+            int composerTop = findComposerTop(image.getHeight());
+            Target target = findFishing(text, image, composerTop);
+            if (target == null) target = findFishingFromNodes(image, composerTop);
             long now = SystemClock.uptimeMillis();
 
             if (target != null) {
@@ -565,6 +577,7 @@ public class FishingAccessibilityService extends AccessibilityService {
                 // or scrolling logic. The old 1.4 branch was scrolling
                 // even with a visible button; that caused an endless loop.
                 noButtonSince = 0;
+                revealSwipes = 0;
                 long remainingMs = nextFishingTapEligibleAt - now;
                 if (remainingMs > 0) {
                     status = "낚시 버튼 발견 · 최소 터치 간격 대기 " + remainingMs + "ms";
@@ -576,7 +589,23 @@ public class FishingAccessibilityService extends AccessibilityService {
             }
 
             missed++;
-            if (noButtonSince == 0) noButtonSince = now;
+            if (noButtonSince == 0) {
+                noButtonSince = now;
+                revealSwipes = 0;
+            }
+
+            // A result card is visible but its action row is underneath
+            // Kakao's fixed message composer. Scrolling to OLDER messages
+            // would make it worse: swipe UP (toward newer content) first.
+            if (shouldRevealBottomCard(text, image, composerTop)) {
+                if (revealSwipes < MAX_REVEAL_SWIPES
+                    && now - lastRevealAt >= REVEAL_RETRY_MS) {
+                    revealBottomCard(image.getWidth(), image.getHeight(), composerTop);
+                } else {
+                    status = "하단 버튼이 입력창에 가려짐 → 재확인 중";
+                }
+                return;
+            }
             boolean resultCard = hasResultChoices(text);
             boolean shouldSeek = resultCard || olderSwipes > 0
                 || now - noButtonSince >= STALL_MS;
@@ -895,19 +924,109 @@ public class FishingAccessibilityService extends AccessibilityService {
         }
     }
 
-    private Target findFishing(Text result, Bitmap image) {
-        Target best = null;
-        for (Text.TextBlock block : result.getTextBlocks()) {
-            for (Text.Line line : block.getLines()) {
-                if (isFishing(line.getText())) {
-                    best = choose(image, line.getBoundingBox(), best);
-                }
-                for (Text.Element word : line.getElements()) {
-                    if (isFishing(word.getText())) {
-                        best = choose(image, word.getBoundingBox(), best);
-                    }
+    /**
+     * The Kakao message input is an overlay above the message list.
+     * Even if OCR reads a fishing label THROUGH it, the coordinate cannot
+     * be tapped safely. Fall back conservatively if the accessibility
+     * bounds are not available.
+     */
+    private int findComposerTop(int screenHeight) {
+        int fallback = (int) (screenHeight * .866);
+        AccessibilityNodeInfo root = getRootInActiveWindow();
+        if (root == null) return fallback;
+        ArrayDeque<AccessibilityNodeInfo> queue = new ArrayDeque<>();
+        queue.add(root);
+        int visited = 0, best = screenHeight;
+        while (!queue.isEmpty() && visited++ < 650) {
+            AccessibilityNodeInfo n = queue.removeFirst();
+            CharSequence txt = n.getText();
+            CharSequence desc = n.getContentDescription();
+            boolean composer = n.isEditable()
+                || (txt != null && txt.toString().contains("메시지 입력"))
+                || (desc != null && desc.toString().contains("메시지 입력"));
+            if (composer) {
+                Rect r = new Rect();
+                n.getBoundsInScreen(r);
+                if (r.top > screenHeight * .66 && r.top < screenHeight * .98) {
+                    // The input field sits inside a thicker, floating toolbar.
+                    best = Math.min(best, r.top - Math.max(12,
+                        (int)(screenHeight * .015)));
                 }
             }
+            for (int i = 0; i < n.getChildCount(); i++) {
+                AccessibilityNodeInfo c = n.getChild(i);
+                if (c != null) queue.add(c);
+            }
+        }
+        return best == screenHeight ? fallback : Math.min(fallback, best);
+    }
+
+    private boolean withinTouchableChat(Rect rect, int width, int height,
+            int composerTop) {
+        if (rect == null || rect.width() < 7 || rect.height() < 7)
+            return false;
+        // Reject notification banners, the message composer and system nav.
+        int margin = Math.max(12, (int)(height * .01));
+        return rect.left >= width * .10 && rect.right <= width * .91
+            && rect.top >= height * .16
+            && rect.bottom < composerTop - margin
+            && rect.height() <= height * .10
+            && rect.width() <= width * .50;
+    }
+
+    private boolean isCompanion(String value) {
+        String cleaned = value.replaceAll("[^가-힣]", "");
+        return "대결".equals(cleaned) || "강화".equals(cleaned)
+            || "자랑하기".equals(cleaned);
+    }
+
+    private boolean sameButtonRow(Rect fish, Rect other, int w, int h) {
+        return fish != null && other != null
+            && Math.abs(fish.centerY() - other.centerY())
+                <= Math.max(26, (int)(h * .031))
+            && Math.abs(fish.centerX() - other.centerX()) > w * .10
+            && Math.abs(fish.centerX() - other.centerX()) < w * .72;
+    }
+
+    private Target findFishing(Text result, Bitmap image, int composerTop) {
+        ArrayList<Rect> fish = new ArrayList<>();
+        ArrayList<Rect> companions = new ArrayList<>();
+        for (Text.TextBlock block : result.getTextBlocks()) {
+            for (Text.Line line : block.getLines()) {
+                if (isFishing(line.getText()) && line.getElements().size() <= 1)
+                    fish.add(line.getBoundingBox());
+                for (Text.Element element : line.getElements()) {
+                    String label = element.getText();
+                    if (isFishing(label)) fish.add(element.getBoundingBox());
+                    else if (isCompanion(label))
+                        companions.add(element.getBoundingBox());
+                }
+            }
+        }
+
+        Target best = null;
+        int w = image.getWidth(), h = image.getHeight();
+        for (Rect r : fish) {
+            if (!withinTouchableChat(r, w, h, composerTop)) {
+                blockedTextCandidates++;
+                continue;
+            }
+            boolean paired = false;
+            for (Rect q : companions) {
+                if (sameButtonRow(r, q, w, h)) {
+                    paired = true;
+                    break;
+                }
+            }
+            // Gray background ALONE also appears in message bubbles. A
+            // neighboring action button is required to avoid tapping text.
+            if (!paired || !isGreyButton(image, r)) {
+                blockedTextCandidates++;
+                continue;
+            }
+            Target t = new Target(r.centerX(), r.centerY(),
+                r.centerX() < w / 2 ? "왼쪽" : "오른쪽");
+            if (best == null || t.y > best.y) best = t;
         }
         return best;
     }
@@ -916,17 +1035,7 @@ public class FishingAccessibilityService extends AccessibilityService {
         return "낚시".equals(raw.replaceAll("[^가-힣]", ""));
     }
 
-    private Target choose(Bitmap image, Rect rect, Target best) {
-        if (rect == null || rect.width() <= 6 || rect.height() <= 6) return best;
-        int w = image.getWidth(), h = image.getHeight();
-        int x = rect.centerX(), y = rect.centerY();
-        if (x <= w * .10 || x >= w * .91 || y <= h * .14 || y >= h * .91) return best;
-        if (!isGreyButton(image, rect)) return best;
-        Target target = new Target(x, y, x < w / 2 ? "왼쪽" : "오른쪽");
-        return best == null || best.y < target.y ? target : best;
-    }
-
-    private Target findFishingFromNodes(Bitmap image) {
+    private Target findFishingFromNodes(Bitmap image, int composerTop) {
         AccessibilityNodeInfo root = getRootInActiveWindow();
         if (root == null || root.getPackageName() == null
             || !KAKAO.contentEquals(root.getPackageName())) return null;
@@ -939,19 +1048,17 @@ public class FishingAccessibilityService extends AccessibilityService {
         while (!queue.isEmpty() && count++ < 900) {
             AccessibilityNodeInfo node = queue.removeFirst();
             if (node.isVisibleToUser()) {
-                String name = node.getText() == null ? "" : node.getText().toString().trim();
-                String description = node.getContentDescription() == null ? ""
+                String name = node.getText() == null ? ""
+                    : node.getText().toString().trim();
+                String desc = node.getContentDescription() == null ? ""
                     : node.getContentDescription().toString().trim();
                 Rect bounds = new Rect();
                 node.getBoundsInScreen(bounds);
-                if (bounds.width() > 10 && bounds.width() < w * .52
-                    && bounds.height() > 10 && bounds.height() < h * .11
-                    && bounds.centerY() > h * .14 && bounds.centerY() < h * .91) {
-                    if ("낚시".equals(name) || "낚시".equals(description)) fish.add(bounds);
-                    if ("대결".equals(name) || "강화".equals(name)
-                        || "대결".equals(description) || "강화".equals(description)) {
+                if (withinTouchableChat(bounds, w, h, composerTop)) {
+                    if ("낚시".equals(name) || "낚시".equals(desc))
+                        fish.add(bounds);
+                    if (isCompanion(name) || isCompanion(desc))
                         neighbor.add(bounds);
-                    }
                 }
             }
             for (int i = 0; i < node.getChildCount(); i++) {
@@ -964,22 +1071,72 @@ public class FishingAccessibilityService extends AccessibilityService {
         for (Rect r : fish) {
             boolean paired = false;
             for (Rect q : neighbor) {
-                if (Math.abs(q.centerY() - r.centerY()) < Math.max(24, h * .025)
-                    && Math.abs(q.centerX() - r.centerX()) > 45) {
+                if (sameButtonRow(r, q, w, h)) {
                     paired = true;
                     break;
                 }
             }
-            // The companion button is sometimes clipped off-screen while
-            // scrolling older chat messages. Exact "낚시" text + genuine
-            // light gray button backing is enough in that case.
-            if (isGreyButton(image, r)) {
+            if (paired && isGreyButton(image, r)) {
                 Target t = new Target(r.centerX(), r.centerY(),
                     r.centerX() < w / 2 ? "왼쪽" : "오른쪽");
                 if (best == null || t.y > best.y) best = t;
+            } else {
+                blockedTextCandidates++;
             }
         }
         return best;
+    }
+
+    /**
+     * Avoid an endless older-message scroll when the white catch-result
+     * card itself extends beneath the fixed dark Kakao composer.
+     */
+    private boolean shouldRevealBottomCard(Text recognized, Bitmap image,
+            int composerTop) {
+        int w = image.getWidth(), h = image.getHeight();
+        if (composerTop < h * .68 || composerTop > h * .96) return false;
+        boolean fishResult = false;
+        boolean catchSize = false;
+        for (Text.TextBlock block : recognized.getTextBlocks()) {
+            String t = block.getText();
+            if (t.contains("등급") || t.contains("자랑하기")
+                || t.contains("놓아준다")) fishResult = true;
+            if (t.contains("cm") || t.contains("㎝")) catchSize = true;
+        }
+        if (!fishResult || !catchSize) return false;
+
+        int whiteSamples = 0;
+        for (int i=0; i<3; i++) {
+            int y = composerTop - 24 - i * Math.max(23, h / 45);
+            for (double fraction : new double[]{.23,.44,.69}) {
+                int x = (int)(w * fraction);
+                if (x < 0 || y < 0 || x >= w || y >= h) continue;
+                int c = image.getPixel(x,y);
+                if (Color.red(c) > 220 && Color.green(c) > 220
+                    && Color.blue(c) > 220) whiteSamples++;
+            }
+        }
+        return whiteSamples >= 4;
+    }
+
+    private void revealBottomCard(int width, int height, int composerTop) {
+        if (!running || scanning == false || tapping || returningToLatest
+            || !visibleKakaoChat()) return;
+        lastRevealAt = SystemClock.uptimeMillis();
+        status = "실제 낚시 버튼이 입력창에 가려짐 → 카드 위로 이동";
+        // Finger UP = the message card moves UP, clearing the fixed bar.
+        int x = (int)(width * .88);
+        int fromY = Math.min((int)(height * .72), composerTop - 80);
+        int toY = Math.max((int)(height * .36), fromY - (int)(height * .32));
+        dispatchAction(x, fromY, x, toY, 280, Action.SCROLL, () -> {
+            revealSwipes++;
+            revealedBottomButtons++;
+            recordEvent("가려진 하단 버튼 표시: " + revealSwipes);
+            noButtonSince = 0;
+            lastVisualSample = null;
+            status = "스크롤 완료 → 실제 낚시 버튼 재검사";
+            schedule(500);
+        });
     }
 
     private boolean isGreyButton(Bitmap image, Rect bounds) {
