@@ -589,10 +589,7 @@ public class FishingAccessibilityService extends AccessibilityService {
             }
 
             missed++;
-            if (noButtonSince == 0) {
-                noButtonSince = now;
-                revealSwipes = 0;
-            }
+            if (noButtonSince == 0) noButtonSince = now;
 
             // A result card is visible but its action row is underneath
             // Kakao's fixed message composer. Scrolling to OLDER messages
@@ -1103,7 +1100,8 @@ public class FishingAccessibilityService extends AccessibilityService {
                 || t.contains("놓아준다")) fishResult = true;
             if (t.contains("cm") || t.contains("㎝")) catchSize = true;
         }
-        if (!fishResult || !catchSize) return false;
+        if (!fishResult || !catchSize || hasResultChoices(recognized))
+            return false;
 
         int whiteSamples = 0;
         for (int i=0; i<3; i++) {
@@ -1132,7 +1130,8 @@ public class FishingAccessibilityService extends AccessibilityService {
             revealSwipes++;
             revealedBottomButtons++;
             recordEvent("가려진 하단 버튼 표시: " + revealSwipes);
-            noButtonSince = 0;
+            // Preserve revealSwipes across retries so we cannot enter a
+            // rapid infinite scroll loop if the button is still hidden.
             lastVisualSample = null;
             status = "스크롤 완료 → 실제 낚시 버튼 재검사";
             schedule(500);
