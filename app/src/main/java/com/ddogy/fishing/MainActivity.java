@@ -165,7 +165,10 @@ public class MainActivity extends Activity {
         status.setText(!enabled ? "⚪ 접근성 권한을 켜 주세요" : running ? "🟢 실행 중" : "🟡 준비 완료 / 중지 상태");
         details.setText(!enabled
                 ? "Fishing 도우미가 비활성 상태입니다."
-                : "클릭 " + service.getClickCount() + "회\n" + service.getCurrentStatus());
+                : "클릭 " + service.getClickCount() + "회 · 스캔 " + service.getScans() + "회\n" +
+                  "미인식 " + service.getUnmatchedScans() + "회 · 캡처 오류 " +
+                  service.getCaptureFailures() + "회 · 지연 복구 " + service.getTimeouts() + "회\n" +
+                  service.getCurrentStatus());
         start.setEnabled(enabled && !running);
         start.setAlpha(enabled && !running ? 1f : 0.5f);
         stop.setEnabled(running);
