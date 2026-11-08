@@ -121,6 +121,9 @@ public class MainActivity extends Activity {
             "• 카카오톡에서 열린 사진 뷰어도 뒤로가기로 복귀\n" +
             "• 복귀는 최근 카카오톡 채팅을 확인했을 때만, 최대 3회 시도\n" +
             "• 버튼이 없고 3초 이상 정지하면 이전 메시지에서 재탐색\n" +
+            "• 실제 회색 낚시 버튼 + 옆 버튼(강화/대결/자랑하기)을 함께 확인\n" +
+            "• 채팅 텍스트 '낚시'는 누르지 않음\n" +
+            "• 하단 버튼이 입력창에 가려지면 채팅을 위로 스크롤 후 재탐색\n" +
             "• '낚시' 버튼 발견 시 스크롤을 멈추고 우선 클릭\n" +
             "• 터치와 스크롤을 동시에 실행하지 않음\n" +
             "• 12.5초 이상 작업 정지 시 독립 감시기가 자동 복구\n" +
@@ -145,7 +148,7 @@ public class MainActivity extends Activity {
                 " 낚시 웹페이지·사진 뷰어에서 채팅 복귀와 채팅 새로고침을 위해 " +
                 "카카오톡에 표시된 화면과 UI 정보를 확인합니다. " +
                 "채팅에 보이는 다른 텍스트도 이 과정에서 화면 분석에 포함될 수 있습니다.\n\n" +
-                "사용자가 시작을 누른 뒤에만 확인된 '낚시' 버튼을 터치하고," +
+                "사용자가 시작을 누른 뒤에만 옆의 다른 버튼과 배경까지 확인된 '낚시' 버튼을 터치하고," +
                 " 버튼이 없으면 제한적으로 채팅을 스크롤합니다." +
                 " 카카오톡에서 열린 낚시 웹페이지와 사진 뷰어를 확인하면 채팅 복귀를 위해 뒤로가기를 수행합니다. " +
                 "화면을 외부 서버로 전송하거나 저장하지 않으며, 기기 내부에서만 분석합니다.\n\n" +
@@ -200,6 +203,8 @@ public class MainActivity extends Activity {
                   service.getRescuedPhotoViews() + "회 · 웹 뒤로 " +
                   service.getRescuedWebViews() + "회 · 제스처 취소 " +
                   service.getCancelledGestures() + "회\n" +
+                  "하단 가림 복구 " + service.getRevealedBottomButtons() +
+                  "회 · 텍스트 오인 차단 " + service.getBlockedTextCandidates() + "회\n" +
                   "자동 멈춤 복구 " + service.getWatchdogRecoveries() + "회 · 마지막 간격 " +
                   service.getLastChosenTapIntervalMs() + "ms · 탐색 활동 " +
                   service.getLastProgressAgeSeconds() + "초 전\n" +
