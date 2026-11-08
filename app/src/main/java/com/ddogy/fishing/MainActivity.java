@@ -84,6 +84,17 @@ public class MainActivity extends Activity {
                 startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS));
                 return;
             }
+            String conflict = service.getConflictingService();
+            if (!conflict.isEmpty()) {
+                new AlertDialog.Builder(this)
+                    .setTitle("다른 Fishing 자동화 앱 실행 중")
+                    .setMessage("기존 Fishing 버전의 접근성 서비스가 동시에 켜져 있습니다. 두 앱의 자동 터치가 충돌할 수 있어요. 기존 버전의 접근성 서비스를 끈 후 새 앱을 시작해 주세요.\n\n" + conflict)
+                    .setPositiveButton("접근성 설정 열기", (dialog, which) ->
+                        startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)))
+                    .setNegativeButton("취소", null)
+                    .show();
+                return;
+            }
             service.startRunning();
             refresh();
             Toast.makeText(this, "카카오톡 낚시 채팅으로 이동하세요.", Toast.LENGTH_LONG).show();
@@ -100,7 +111,7 @@ public class MainActivity extends Activity {
 
         TextView guide = text(
             "사용법\n\n① 접근성 권한에서 'Fishing 도우미' 허용\n② 자동 낚시 시작 누르기\n③ 카카오톡 낚시방으로 이동\n④ 멈출 때 이 앱으로 돌아와 중지\n\n" +
-            "• 인식 주기: 1.8~2.2초 랜덤(처리 시간은 별도)\n" +
+            "• 낚시 터치 간격: 2.0~2.2초 사이 랜덤(인식 지연 시 더 길 수 있음)\n" +
             "• '낚시'라고 적힌 회색 버튼만 클릭\n" +
             "• 왼쪽/오른쪽 위치 자동 인식\n" +
             "• '자랑하기 / 놓아준다' 결과 카드만 보이면 이전 메시지로 이동해 낚시 버튼 검색\n" +
@@ -109,6 +120,8 @@ public class MainActivity extends Activity {
             "• 버튼이 없고 3초 이상 정지하면 이전 메시지에서 재탐색\n" +
             "• '낚시' 버튼 발견 시 스크롤을 멈추고 우선 클릭\n" +
             "• 터치와 스크롤을 동시에 실행하지 않음\n" +
+            "• 12.5초 이상 작업 정지 시 독립 감시기가 자동 복구\n" +
+            "• 다른 Fishing 버전 접근성 서비스가 켜져 있으면 중복 실행 방지\n" +
             "• 버튼을 찾지 못하면 클릭하지 않음\n" +
             "• 화면은 기기 안에서만 분석, 외부 전송 없음\n" +
             "• 카카오톡 외 다른 앱은 누르지 않음\n\n" +
@@ -180,7 +193,11 @@ public class MainActivity extends Activity {
                   "복구 스크롤 " + service.getRecoveryCount() + "회 · 웹 닫기 " +
                   service.getPopupsClosed() + "회 · 제스처 취소 " +
                   service.getCancelledGestures() + "회\n" +
-                  service.getCurrentStatus());
+                  "자동 멈춤 복구 " + service.getWatchdogRecoveries() + "회 · 마지막 간격 " +
+                  service.getLastChosenTapIntervalMs() + "ms · 탐색 활동 " +
+                  service.getLastProgressAgeSeconds() + "초 전\n" +
+                  "최근 복구 원인: " + service.getLastRecoveryReason() + "\n" +
+                  service.getCurrentStatus() + "\n" + service.getRecentEvents());
         start.setEnabled(enabled && !running);
         start.setAlpha(enabled && !running ? 1f : 0.5f);
         stop.setEnabled(running);
