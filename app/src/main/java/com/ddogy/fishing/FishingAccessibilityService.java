@@ -693,7 +693,16 @@ public class FishingAccessibilityService extends AccessibilityService {
         if (!running || gestureBusy) return;
         AccessibilityNodeInfo root = getRootInActiveWindow();
         if (root == null || root.getPackageName() == null
-                || !KAKAO_PACKAGE.contentEquals(root.getPackageName())) return;
+                || !KAKAO_PACKAGE.contentEquals(root.getPackageName())) {
+            // Accessibility window may change between chat confirmation
+            // and dispatch. Never leave the recovery state stuck.
+            if (recovering) {
+                recovering = false;
+                status = "채팅 화면 변경 감지 → 재확인";
+                schedule(900);
+            }
+            return;
+        }
 
         int id = ++gestureToken;
         gestureBusy = true;
