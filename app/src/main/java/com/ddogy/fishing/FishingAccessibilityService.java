@@ -45,6 +45,7 @@ public class FishingAccessibilityService extends AccessibilityService {
     private static final long RETRY_OLDER_COOLDOWN_MS = 9000;
     private static final long SESSION_WATCHDOG_MS = 12500;
     private static final long HEARTBEAT_INTERVAL_MS = 2500;
+    private static final long SCROLL_SETTLE_MS = 650;
     private static final int MIN_FISH_TAP_INTERVAL_MS = 2100;
     private static final int MAX_FISH_TAP_INTERVAL_MS = 2300;
     // A view must have been reached directly after an observed Kakao chat.
@@ -93,6 +94,10 @@ public class FishingAccessibilityService extends AccessibilityService {
     private int olderSwipes;
     private boolean returningToLatest;
     private int sessionId;
+    private long settledAfterAt;
+    private Runnable afterScanAction;
+    private long serializedGestures;
+    private long deferredGestureActions;
     private long lastProgressAt;
     private long watchdogRecoveries;
     private String lastRecoveryReason = "없음";
@@ -119,6 +124,8 @@ public class FishingAccessibilityService extends AccessibilityService {
                 scanToken++;
                 gestureToken++;
                 sessionId++;
+                afterScanAction = null;
+                settledAfterAt = 0;
                 scanning = false;
                 tapping = false;
                 returningToLatest = false;
@@ -165,6 +172,8 @@ public class FishingAccessibilityService extends AccessibilityService {
     public long getBlockedTextCandidates() { return blockedTextCandidates; }
     public long getVisualPairFallbacks() { return visualPairFallbacks; }
     public long getMergedOcrPairs() { return mergedOcrPairs; }
+    public long getSerializedGestures() { return serializedGestures; }
+    public long getDeferredGestureActions() { return deferredGestureActions; }
 
     /**
      * Detect older installs of THIS project that may run a second
@@ -200,6 +209,7 @@ public class FishingAccessibilityService extends AccessibilityService {
     private final Runnable scanTimeout = () -> {
         if (!running || !scanning) return;
         scanToken++;
+        afterScanAction = null;
         scanning = false;
         failures++;
         status = "화면 인식 지연 → 다시 검사";
@@ -269,6 +279,8 @@ public class FishingAccessibilityService extends AccessibilityService {
         scanToken++;
         gestureToken++;
         sessionId++;
+        afterScanAction = null;
+        settledAfterAt = 0;
         olderSwipes = 0;
         returningToLatest = false;
         noButtonSince = 0;
@@ -300,6 +312,8 @@ public class FishingAccessibilityService extends AccessibilityService {
         scanToken++;
         gestureToken++;
         sessionId++;
+        afterScanAction = null;
+        settledAfterAt = 0;
         olderSwipes = 0;
         returningToLatest = false;
         noButtonSince = 0;
@@ -331,8 +345,11 @@ public class FishingAccessibilityService extends AccessibilityService {
         if (running && !scanning && !tapping && !returningToLatest) {
             // A retry can never shorten the random tap spacing.
             // Scan OCR again when the next tap becomes eligible.
-            long remaining = nextFishingTapEligibleAt - SystemClock.uptimeMillis();
-            main.postDelayed(ticker, Math.max(delayMs, Math.max(0, remaining)));
+            long now = SystemClock.uptimeMillis();
+            long remaining = nextFishingTapEligibleAt - now;
+            long settleRemaining = settledAfterAt - now;
+            main.postDelayed(ticker, Math.max(delayMs,
+                Math.max(0, Math.max(remaining, settleRemaining))));
         }
     }
 
@@ -468,6 +485,11 @@ public class FishingAccessibilityService extends AccessibilityService {
 
     private void scanOnce() {
         if (!running || scanning || tapping || returningToLatest) return;
+        long settleRemaining = settledAfterAt - SystemClock.uptimeMillis();
+        if (settleRemaining > 0) {
+            schedule(settleRemaining);
+            return;
+        }
         recordProgress();
         if (!getConflictingService().isEmpty()) {
             status = "다른 Fishing 앱의 접근성 서비스와 중복됨 → 중지";
@@ -490,6 +512,7 @@ public class FishingAccessibilityService extends AccessibilityService {
         if (hasKakaoChatComposer()) observedChat();
 
         scanning = true;
+        afterScanAction = null;
         scans++;
         final int id = ++scanToken;
         main.removeCallbacks(scanTimeout);
@@ -555,13 +578,13 @@ public class FishingAccessibilityService extends AccessibilityService {
             // appear editable and otherwise look like a chat composer.
             if (isFishingWebsite(text, image.getHeight()) && !hasKakaoChatComposer()) {
                 status = "낚시 웹페이지 감지 → 닫기/뒤로가기";
-                closeFishingWebsite(text, image);
+                deferScanAction(id, () -> closeFishingWebsite(text, image));
                 return;
             }
             // The Kakao photo viewer can expose old chat edit fields
             // behind its overlay. Positive viewer evidence takes priority.
             if (isKakaoPhotoViewer(text, image.getHeight())) {
-                goBackFromTrustedView("카카오톡 사진 보기");
+                deferScanAction(id, () -> goBackFromTrustedView("카카오톡 사진 보기"));
                 return;
             }
             if (!inChat) {
@@ -594,7 +617,8 @@ public class FishingAccessibilityService extends AccessibilityService {
                     return;
                 }
                 status = "낚시 버튼 확인 (" + target.side + ") → 터치";
-                tap(target.x, target.y);
+                final int tapX = target.x, tapY = target.y;
+                deferScanAction(id, () -> tap(tapX, tapY));
                 return;
             }
 
@@ -607,7 +631,8 @@ public class FishingAccessibilityService extends AccessibilityService {
             if (shouldRevealBottomCard(text, image, composerTop)) {
                 if (revealSwipes < MAX_REVEAL_SWIPES
                     && now - lastRevealAt >= REVEAL_RETRY_MS) {
-                    revealBottomCard(image.getWidth(), image.getHeight(), composerTop);
+                    final int width = image.getWidth(), height = image.getHeight();
+                    deferScanAction(id, () -> revealBottomCard(width, height, composerTop));
                 } else {
                     status = "하단 버튼이 입력창에 가려짐 → 재확인 중";
                 }
@@ -618,7 +643,8 @@ public class FishingAccessibilityService extends AccessibilityService {
                 || now - noButtonSince >= STALL_MS;
             if (shouldSeek && (olderSwipes > 0
                 || now - lastSeekAt >= RETRY_OLDER_COOLDOWN_MS)) {
-                searchOlderButton(image.getWidth(), image.getHeight());
+                final int width = image.getWidth(), height = image.getHeight();
+                deferScanAction(id, () -> searchOlderButton(width, height));
             } else {
                 status = resultCard
                     ? "결과 카드 발견 → 이전 낚시 버튼 탐색 준비"
@@ -630,17 +656,43 @@ public class FishingAccessibilityService extends AccessibilityService {
                 status = "한글 인식 실패 → 재시도";
             }
         }).addOnCompleteListener(t -> {
-            if (!image.isRecycled()) image.recycle();
-            finishScan(id, 850);
+            // Finish OCR first; deferred UI operations may briefly need
+            // these pixels to identify the right window/button.
+            try {
+                finishScan(id, 850);
+            } finally {
+                if (!image.isRecycled()) image.recycle();
+            }
         });
+    }
+
+    private void deferScanAction(int scanId, Runnable action) {
+        if (!running || scanId != scanToken) return;
+        afterScanAction = action;
+        deferredGestureActions++;
     }
 
     private void finishScan(int id, long delayMs) {
         if (id != scanToken) return;
+        // OCR must finish BEFORE any tap or swipe can begin.
+        Runnable action = afterScanAction;
+        afterScanAction = null;
         scanning = false;
         main.removeCallbacks(scanTimeout);
         recordProgress();
-        schedule(delayMs);
+        if (action != null) {
+            try {
+                action.run();
+            } catch (Exception error) {
+                failures++;
+                status = "인식 후 동작 실패 → 재검사";
+                recordEvent("스캔 후 동작 예외");
+            }
+            // If a stale view caused dispatch rejection, try scanning again.
+            if (!tapping && !returningToLatest) schedule(delayMs);
+        } else {
+            schedule(delayMs);
+        }
     }
 
 
@@ -921,7 +973,7 @@ public class FishingAccessibilityService extends AccessibilityService {
         int lower = Math.round(h * .73f);
         boolean dispatched = dispatchAction(x, lower, x, upper, 280,
             Action.SCROLL, () -> main.postDelayed(
-                () -> doReturnStep(remaining - 1, session), 300));
+                () -> doReturnStep(remaining - 1, session), SCROLL_SETTLE_MS));
         if (!dispatched) {
             returningToLatest = false;
             olderSwipes = 0;
@@ -1222,7 +1274,7 @@ public class FishingAccessibilityService extends AccessibilityService {
     }
 
     private void revealBottomCard(int width, int height, int composerTop) {
-        if (!running || scanning == false || tapping || returningToLatest
+        if (!running || scanning || tapping || returningToLatest
             || !visibleKakaoChat()) return;
         lastRevealAt = SystemClock.uptimeMillis();
         status = "실제 낚시 버튼이 입력창에 가려짐 → 카드 위로 이동";
@@ -1302,10 +1354,13 @@ public class FishingAccessibilityService extends AccessibilityService {
             boolean accepted = dispatchGesture(gesture, new GestureResultCallback() {
                 @Override public void onCompleted(GestureDescription value) {
                     if (id != gestureToken) return;
+                    if (action == Action.SCROLL)
+                        settledAfterAt = SystemClock.uptimeMillis() + SCROLL_SETTLE_MS;
                     tapping = false;
                     main.removeCallbacks(tapTimeout);
                     recordProgress();
                     if (!running) return;
+                    serializedGestures++;
                     if (action == Action.FISH) {
                         clicks++;
                         lastFishingTapAt = SystemClock.uptimeMillis();
