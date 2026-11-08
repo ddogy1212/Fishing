@@ -41,16 +41,7 @@ public class FishingAccessibilityService extends AccessibilityService {
     private final Handler main = new Handler(Looper.getMainLooper());
     private final Random random = new Random();
     private final Runnable ticker = this::scanOnce;
-    private final Runnable watchdog = () -> {
-        if (!running || !working) return;
-        // OCR and screenshot callbacks do not have a guaranteed deadline.
-        // Discard stale callback work, then schedule a fresh scan.
-        scanToken++;
-        working = false;
-        scanTimeouts++;
-        status = "화면 인식 지연 복구 중 (" + scanTimeouts + "회)";
-        schedule(650);
-    };
+
 
     private TextRecognizer recognizer;
     private boolean running = false;
@@ -64,6 +55,17 @@ public class FishingAccessibilityService extends AccessibilityService {
     private long captureFailures = 0;
     private long unmatchedScans = 0;
     private String status = "준비 완료";
+
+    private final Runnable watchdog = () -> {
+        if (!running || !working) return;
+        // OCR and screenshot callbacks do not have a guaranteed deadline.
+        // Discard stale callback work, then schedule a fresh scan.
+        scanToken++;
+        working = false;
+        scanTimeouts++;
+        status = "화면 인식 지연 복구 중 (" + scanTimeouts + "회)";
+        schedule(650);
+    };
 
     @Override protected void onServiceConnected() {
         super.onServiceConnected();
