@@ -149,8 +149,15 @@ public class FishingAccessibilityService extends AccessibilityService {
      * manipulate Android accessibility settings.
      */
     public String getConflictingService() {
-        String enabled = Settings.Secure.getString(getContentResolver(),
-            Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES);
+        String enabled;
+        try {
+            enabled = Settings.Secure.getString(getContentResolver(),
+                Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES);
+        } catch (SecurityException e) {
+            // Some managed devices restrict reading enabled services.
+            // Never crash a fishing session because of this optional check.
+            return "";
+        }
         if (enabled == null || enabled.isEmpty()) return "";
         for (String item : enabled.split(":")) {
             ComponentName component = ComponentName.unflattenFromString(item);
