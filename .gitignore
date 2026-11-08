@@ -5,3 +5,10 @@ app/build/
 local.properties
 *.iml
 .DS_Store
+
+# Signing secrets must never enter a public repository
+*.jks
+*.keystore
+*.p12
+signing.properties
+release-signing.env
