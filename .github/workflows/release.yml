@@ -1,0 +1,73 @@
+name: Signed Android release (stable certificate)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Check required private signing secrets
+        env:
+          KEYSTORE: ${{ secrets.FISHING_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.FISHING_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.FISHING_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.FISHING_KEY_PASSWORD }}
+        run: |
+          if [ -z "$KEYSTORE" ] || [ -z "$STORE_PASSWORD" ] || [ -z "$KEY_ALIAS" ] || [ -z "$KEY_PASSWORD" ]; then
+            echo "::error::Set FISHING_KEYSTORE_BASE64, FISHING_STORE_PASSWORD, FISHING_KEY_ALIAS and FISHING_KEY_PASSWORD in GitHub repository Actions secrets."
+            exit 1
+          fi
+
+      - name: Install Android SDK
+        run: |
+          SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" -type f -name sdkmanager | head -1)"
+          test -n "$SDKMANAGER"
+          "$SDKMANAGER" --install "platforms;android-35" "build-tools;35.0.0"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Restore private key file
+        env:
+          KEYSTORE: ${{ secrets.FISHING_KEYSTORE_BASE64 }}
+        run: |
+          install -d "$RUNNER_TEMP/signing"
+          printf '%s' "$KEYSTORE" | base64 --decode > "$RUNNER_TEMP/signing/fishing-release.jks"
+          test -s "$RUNNER_TEMP/signing/fishing-release.jks"
+
+      - name: Build with the same release certificate on every run
+        env:
+          FISHING_KEYSTORE_PATH: ${{ runner.temp }}/signing/fishing-release.jks
+          FISHING_STORE_PASSWORD: ${{ secrets.FISHING_STORE_PASSWORD }}
+          FISHING_KEY_ALIAS: ${{ secrets.FISHING_KEY_ALIAS }}
+          FISHING_KEY_PASSWORD: ${{ secrets.FISHING_KEY_PASSWORD }}
+        run: gradle --no-daemon assembleRelease
+
+      - name: Verify actual APK signature
+        run: |
+          APKSIGNER="$ANDROID_HOME/build-tools/35.0.0/apksigner"
+          "$APKSIGNER" verify --verbose --print-certs app/build/outputs/apk/release/app-release.apk
+          test -s app/build/outputs/apk/release/app-release.apk
+
+      - name: Upload signed APK (never upload key)
+        uses: actions/upload-artifact@v4
+        with:
+          name: Fishing-signed-release-apk
+          path: app/build/outputs/apk/release/app-release.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Remove temporary key
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/signing"
