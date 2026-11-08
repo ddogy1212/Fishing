@@ -40,7 +40,7 @@ public class FishingAccessibilityService extends AccessibilityService {
     private static final int OCR_TIMEOUT_MS = 9000;
     private static final int GESTURE_TIMEOUT_MS = 4000;
     private static final long STALL_MS = 3000;
-    private static final long RETRY_OLDER_COOLDOWN_MS = 7000;
+    private static final long RETRY_OLDER_COOLDOWN_MS = 22000;
     private static final int MAX_OLDER_SWIPES = 3;
     private final Handler main = new Handler(Looper.getMainLooper());
     private final Random random = new Random();
@@ -62,7 +62,6 @@ public class FishingAccessibilityService extends AccessibilityService {
     private long lastFishingTapAt;
     private long noButtonSince;
     private long lastSeekAt = -RETRY_OLDER_COOLDOWN_MS;
-    private long lastRefreshAt = -10000;
     private long lastVisualChangeAt;
     private int[] lastVisualSample;
     private int olderSwipes;
@@ -284,22 +283,17 @@ public class FishingAccessibilityService extends AccessibilityService {
                 return;
             }
 
-            boolean unchanged = recordVisualFrame(image);
+            recordVisualFrame(image);
             Target target = findFishing(text, image);
             if (target == null) target = findFishingFromNodes(image);
             long now = SystemClock.uptimeMillis();
 
             if (target != null) {
+                // A visible, verified fishing button ALWAYS wins over refresh
+                // or scrolling logic. The old 1.4 branch was scrolling
+                // even with a visible button; that caused an endless loop.
                 noButtonSince = 0;
-                // If the same chat screen persists after a completed tap,
-                // safely refresh the chat viewport without overlapping taps.
-                if (olderSwipes == 0 && unchanged
-                    && lastFishingTapAt > 0 && now - lastFishingTapAt >= STALL_MS
-                    && now - lastRefreshAt >= 10000) {
-                    refreshChatViewport(image.getWidth(), image.getHeight());
-                    return;
-                }
-                status = "낚시 버튼 확인 (" + target.side + ") → 터치";
+                status = "낚시 버튼 확인 (" + target.side + ") → 즉시 터치";
                 tap(target.x, target.y);
                 return;
             }
@@ -504,6 +498,9 @@ public class FishingAccessibilityService extends AccessibilityService {
         if (!running || tapping || returningToLatest || !visibleKakaoChat())
             return;
         if (olderSwipes >= MAX_OLDER_SWIPES) {
+            // Reaching the search limit does NOT mean another quick round
+            // trip. Back off before restarting to avoid a bounce loop.
+            lastSeekAt = SystemClock.uptimeMillis();
             returnToLatest(olderSwipes);
             return;
         }
@@ -522,30 +519,6 @@ public class FishingAccessibilityService extends AccessibilityService {
         });
     }
 
-    private void refreshChatViewport(int w, int h) {
-        if (!running || tapping || !visibleKakaoChat()) return;
-        lastRefreshAt = SystemClock.uptimeMillis();
-        status = "3초 화면 정지 → 채팅 위치 새로고침";
-        final int x = Math.round(w * .88f);
-        final int upper = Math.round(h * .43f);
-        final int lower = Math.round(h * .62f);
-        final int session = sessionId;
-        dispatchAction(x, upper, x, lower, 220, Action.SCROLL, () -> {
-            main.postDelayed(() -> {
-                if (!running || session != sessionId || !visibleKakaoChat()) {
-                    schedule(900);
-                    return;
-                }
-                dispatchAction(x, lower, x, upper, 220, Action.SCROLL, () -> {
-                    recoveryCount++;
-                    lastVisualSample = null;
-                    status = "화면 새로고침 → 낚시 버튼 재인식";
-                    schedule(700);
-                });
-            }, 430);
-        });
-    }
-
     private void returnToLatest(int steps) {
         if (!running || returningToLatest || steps <= 0) return;
         returningToLatest = true;
@@ -558,9 +531,10 @@ public class FishingAccessibilityService extends AccessibilityService {
         if (!running || session != sessionId) return;
         if (remaining <= 0) {
             returningToLatest = false;
-            noButtonSince = 0;
+            noButtonSince = SystemClock.uptimeMillis();
+            lastSeekAt = noButtonSince;
             lastVisualSample = null;
-            status = "최신 메시지 복귀 → 낚시 버튼 재탐색";
+            status = "최신 메시지 복귀 → 잠시 대기 후 재탐색";
             schedule(850);
             return;
         }
@@ -657,7 +631,10 @@ public class FishingAccessibilityService extends AccessibilityService {
                     break;
                 }
             }
-            if (paired && isGreyButton(image, r)) {
+            // The companion button is sometimes clipped off-screen while
+            // scrolling older chat messages. Exact "낚시" text + genuine
+            // light gray button backing is enough in that case.
+            if (isGreyButton(image, r)) {
                 Target t = new Target(r.centerX(), r.centerY(),
                     r.centerX() < w / 2 ? "왼쪽" : "오른쪽");
                 if (best == null || t.y > best.y) best = t;
