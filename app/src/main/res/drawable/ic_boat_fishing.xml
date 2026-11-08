@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp"
+    android:viewportWidth="108" android:viewportHeight="108">
+
+    <!-- Blue sea and a sunny sky -->
+    <path android:fillColor="#46B8F5" android:pathData="M0,0 H108 V108 H0 Z"/>
+    <path android:fillColor="#A4E8FF" android:pathData="M0,60 Q18,53 35,61 Q53,68 71,59 Q87,53 108,61 V108 H0 Z"/>
+    <path android:fillColor="#0D91DE" android:pathData="M0,77 Q16,69 34,78 Q51,86 70,77 Q89,69 108,77 V108 H0 Z"/>
+    <path android:fillColor="#0271C9" android:pathData="M0,94 Q16,85 34,94 Q53,103 73,94 Q93,85 108,93 V108 H0 Z"/>
+    <path android:fillColor="#FFFFFF" android:pathData="M62,18 Q61,12 67,11 Q70,3 79,8 Q88,5 90,14 Q98,10 103,17 V21 H62 Z"/>
+    <path android:fillColor="#FFC83D" android:pathData="M80,35 A7,7 0,1 0,94 35 A7,7 0,1 0,80 35 Z"/>
+
+    <!-- Fishing rod and curved line -->
+    <path android:fillColor="#00000000" android:strokeColor="#193652"
+        android:strokeWidth="4.3" android:strokeLineCap="round"
+        android:pathData="M55,59 Q69,27 96,27"/>
+    <path android:fillColor="#00000000" android:strokeColor="#C98742"
+        android:strokeWidth="2.6" android:strokeLineCap="round"
+        android:pathData="M55,59 Q69,27 96,27"/>
+    <path android:fillColor="#00000000" android:strokeColor="#153450"
+        android:strokeWidth="2.1" android:strokeLineCap="round"
+        android:pathData="M96,27 V70 Q96,77 92,77"/>
+    <path android:fillColor="#00000000" android:strokeColor="#16344B"
+        android:strokeWidth="2.4" android:pathData="M91,76 Q95,83 99,75"/>
+
+    <!-- Friendly angler with little sailor hat -->
+    <path android:fillColor="#173754"
+        android:pathData="M17,48 Q17,27 38,27 Q59,27 59,48 L59,62 H17 Z"/>
+    <path android:fillColor="#FAFAF0"
+        android:pathData="M20,45 Q21,29 38,29 Q55,29 56,45 L55,51 Q53,60 38,60 Q22,60 20,51 Z"/>
+    <path android:fillColor="#0C293F" android:pathData="M30,44 A2.8,2.8 0,1 0,35.6 44 A2.8,2.8 0,1 0,30 44 Z"/>
+    <path android:fillColor="#0C293F" android:pathData="M43,44 A2.8,2.8 0,1 0,48.6 44 A2.8,2.8 0,1 0,43 44 Z"/>
+    <path android:fillColor="#00000000" android:strokeColor="#173754"
+        android:strokeWidth="2.8" android:strokeLineCap="round"
+        android:pathData="M29,29 L25,18 M45,29 L49,18"/>
+    <path android:fillColor="#184468" android:pathData="M16,55 Q32,62 57,55 L62,70 H12 Z"/>
+    <path android:fillColor="#FFFFFF" android:pathData="M53,54 A5,5 0,1 0,63 54 A5,5 0,1 0,53 54 Z"/>
+    <path android:fillColor="#153852" android:pathData="M53,54 A5,5 0,1 0,63 54 A5,5 0,1 0,53 54 Z"
+        android:strokeColor="#173754" android:strokeWidth="2"/>
+    <path android:fillColor="#FFFFFF" android:pathData="M55,53 A2.6,2.6 0,1 0,60.2 53 A2.6,2.6 0,1 0,55 53 Z"/>
+
+    <!-- Wood boat with high contrast hull -->
+    <path android:fillColor="#16354D"
+        android:pathData="M8,64 H69 L61,87 Q36,94 17,85 Z"/>
+    <path android:fillColor="#F3AD65"
+        android:pathData="M12,66 H66 L58,84 Q36,89 20,83 Z"/>
+    <path android:fillColor="#B96B3A"
+        android:pathData="M12,73 H63 L61,78 H16 Z"/>
+    <path android:fillColor="#00000000" android:strokeColor="#193B53"
+        android:strokeWidth="2.2" android:pathData="M13,65 H67"/>
+    <path android:fillColor="#D95836"
+        android:pathData="M21,77 A10,10 0,1 0,41 77 A10,10 0,1 0,21 77 Z"/>
+    <path android:fillColor="#FFFFFF"
+        android:pathData="M24,77 A7,7 0,1 0,38 77 A7,7 0,1 0,24 77 Z"/>
+    <path android:fillColor="#AA5F3C"
+        android:pathData="M28,77 A3,3 0,1 0,34 77 A3,3 0,1 0,28 77 Z"/>
+
+    <!-- A jumping fish -->
+    <path android:fillColor="#173C59" android:pathData="M82,80 Q77,73 83,69 Q90,65 95,73 L104,67 L102,80 L105,88 L94,84 Q87,89 82,80 Z"/>
+    <path android:fillColor="#A5DCF4" android:pathData="M85,79 Q81,73 86,72 Q91,70 95,77 L101,74 L100,80 L101,84 L94,81 Q89,85 85,79 Z"/>
+    <path android:fillColor="#173C59" android:pathData="M87,74 A1.8,1.8 0,1 0,90.6 74 A1.8,1.8 0,1 0,87 74 Z"/>
+    <path android:fillColor="#FFFFFF" android:pathData="M75,89 Q80,80 83,89 L88,93 Q82,89 76,95 Z"/>
+</vector>
