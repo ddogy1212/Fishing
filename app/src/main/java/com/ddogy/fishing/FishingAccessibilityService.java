@@ -6,6 +6,8 @@ import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.graphics.Path;
 import android.graphics.Rect;
+import android.content.ComponentName;
+import android.provider.Settings;
 import android.hardware.HardwareBuffer;
 import android.os.Handler;
 import android.os.Looper;
@@ -43,6 +45,8 @@ public class FishingAccessibilityService extends AccessibilityService {
     private static final long RETRY_OLDER_COOLDOWN_MS = 9000;
     private static final long SESSION_WATCHDOG_MS = 12500;
     private static final long HEARTBEAT_INTERVAL_MS = 2500;
+    private static final int MIN_FISH_TAP_INTERVAL_MS = 2000;
+    private static final int MAX_FISH_TAP_INTERVAL_MS = 2200;
     private static final int MAX_OLDER_SWIPES = 3;
     private final Handler main = new Handler(Looper.getMainLooper());
     private final Random random = new Random();
@@ -62,6 +66,9 @@ public class FishingAccessibilityService extends AccessibilityService {
     private long recoveryCount;
     private long popupsClosed;
     private long lastFishingTapAt;
+    private long lastFishingDispatchAt;
+    private long nextFishingTapEligibleAt;
+    private long lastChosenTapIntervalMs;
     private long noButtonSince;
     private long lastSeekAt = -RETRY_OLDER_COOLDOWN_MS;
     private long lastVisualChangeAt;
@@ -123,7 +130,7 @@ public class FishingAccessibilityService extends AccessibilityService {
 
     public String getRecentEvents() {
         StringBuilder out = new StringBuilder();
-        for (String event : recentEvents) out.append("• ").append(event).append("\\n");
+        for (String event : recentEvents) out.append("• ").append(event).append("\n");
         return out.toString();
     }
 
@@ -134,6 +141,31 @@ public class FishingAccessibilityService extends AccessibilityService {
 
     public long getWatchdogRecoveries() { return watchdogRecoveries; }
     public String getLastRecoveryReason() { return lastRecoveryReason; }
+    public long getLastChosenTapIntervalMs() { return lastChosenTapIntervalMs; }
+
+    /**
+     * Detect older installs of THIS project that may run a second
+     * AccessibilityService and cancel our gestures. Does not disable or
+     * manipulate Android accessibility settings.
+     */
+    public String getConflictingService() {
+        String enabled = Settings.Secure.getString(getContentResolver(),
+            Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES);
+        if (enabled == null || enabled.isEmpty()) return "";
+        for (String item : enabled.split(":")) {
+            ComponentName component = ComponentName.unflattenFromString(item);
+            if (component == null) continue;
+            String pkg = component.getPackageName();
+            String clazz = component.getClassName();
+            if (pkg != null && pkg.startsWith("com.ddogy.fishing")
+                && !getPackageName().equals(pkg)
+                && clazz != null
+                && clazz.endsWith(".FishingAccessibilityService")) {
+                return pkg;
+            }
+        }
+        return "";
+    }
 
     private final Runnable scanTimeout = () -> {
         if (!running || !scanning) return;
@@ -160,6 +192,11 @@ public class FishingAccessibilityService extends AccessibilityService {
         recognizer = TextRecognition.getClient(
             new KoreanTextRecognizerOptions.Builder().build());
         if (getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(USER_STARTED, false)) {
+            if (!getConflictingService().isEmpty()) {
+                running = false;
+                status = "이전 Fishing 접근성 서비스가 켜져 있어 자동 실행을 중지했어요";
+                return;
+            }
             running = true;
             recordProgress();
             main.removeCallbacks(heartbeat);
@@ -188,6 +225,12 @@ public class FishingAccessibilityService extends AccessibilityService {
 
     public void startRunning() {
         if (running) return;
+        String conflicting = getConflictingService();
+        if (!conflicting.isEmpty()) {
+            status = "기존 Fishing 도우미 접근성 서비스를 먼저 꺼 주세요: " + conflicting;
+            recordEvent("중복 Fishing 서비스 발견: " + conflicting);
+            return;
+        }
         getSharedPreferences(PREFS, MODE_PRIVATE).edit()
             .putBoolean(USER_STARTED, true).apply();
         running = true;
@@ -202,6 +245,9 @@ public class FishingAccessibilityService extends AccessibilityService {
         lastVisualChangeAt = 0;
         lastVisualSample = null;
         lastSeekAt = -RETRY_OLDER_COOLDOWN_MS;
+        nextFishingTapEligibleAt = 0;
+        lastFishingDispatchAt = 0;
+        lastChosenTapIntervalMs = 0;
         recordProgress();
         main.removeCallbacks(heartbeat);
         main.postDelayed(heartbeat, HEARTBEAT_INTERVAL_MS);
@@ -244,8 +290,12 @@ public class FishingAccessibilityService extends AccessibilityService {
 
     private void schedule(long delayMs) {
         main.removeCallbacks(ticker);
-        if (running && !scanning && !tapping && !returningToLatest)
-            main.postDelayed(ticker, delayMs);
+        if (running && !scanning && !tapping && !returningToLatest) {
+            // A retry can never shorten the random tap spacing.
+            // Scan OCR again when the next tap becomes eligible.
+            long remaining = nextFishingTapEligibleAt - SystemClock.uptimeMillis();
+            main.postDelayed(ticker, Math.max(delayMs, Math.max(0, remaining)));
+        }
     }
 
     private boolean onKakao() {
@@ -280,6 +330,12 @@ public class FishingAccessibilityService extends AccessibilityService {
     private void scanOnce() {
         if (!running || scanning || tapping || returningToLatest) return;
         recordProgress();
+        if (!getConflictingService().isEmpty()) {
+            status = "다른 Fishing 앱의 접근성 서비스와 중복됨 → 중지";
+            recordEvent("중복 접근성 자동화 감지");
+            stopRunning();
+            return;
+        }
         if (!onKakao()) {
             status = "카카오톡 화면 대기 중";
             schedule(950);
@@ -370,7 +426,12 @@ public class FishingAccessibilityService extends AccessibilityService {
                 // or scrolling logic. The old 1.4 branch was scrolling
                 // even with a visible button; that caused an endless loop.
                 noButtonSince = 0;
-                status = "낚시 버튼 확인 (" + target.side + ") → 즉시 터치";
+                long remainingMs = nextFishingTapEligibleAt - now;
+                if (remainingMs > 0) {
+                    status = "낚시 버튼 발견 · 최소 터치 간격 대기 " + remainingMs + "ms";
+                    return;
+                }
+                status = "낚시 버튼 확인 (" + target.side + ") → 터치";
                 tap(target.x, target.y);
                 return;
             }
@@ -777,6 +838,13 @@ public class FishingAccessibilityService extends AccessibilityService {
             long durationMs, Action action, Runnable success) {
         if (!running || tapping || !onKakao()) return false;
         if (action != Action.CLOSE && !visibleKakaoChat()) return false;
+        if (action == Action.FISH) {
+            long remaining = nextFishingTapEligibleAt - SystemClock.uptimeMillis();
+            if (remaining > 0) {
+                status = "낚시 터치 속도 제한 → " + remaining + "ms 대기";
+                return false;
+            }
+        }
         final int id = ++gestureToken;
         recordProgress();
         tapping = true;
@@ -811,7 +879,9 @@ public class FishingAccessibilityService extends AccessibilityService {
                                     returnToLatest(steps);
                             }, 600);
                         } else {
-                            schedule(1800 + random.nextInt(401));
+                            // Not 1.8 seconds from this callback: the timing
+                            // guard is anchored at the actual dispatch time.
+                            schedule(250);
                         }
                     } else if (action == Action.CLOSE) {
                         popupsClosed++;
@@ -843,6 +913,14 @@ public class FishingAccessibilityService extends AccessibilityService {
                 }
             }, main);
             if (accepted) {
+                if (action == Action.FISH) {
+                    long now = SystemClock.uptimeMillis();
+                    lastFishingDispatchAt = now;
+                    lastChosenTapIntervalMs = MIN_FISH_TAP_INTERVAL_MS
+                        + random.nextInt(MAX_FISH_TAP_INTERVAL_MS - MIN_FISH_TAP_INTERVAL_MS + 1);
+                    nextFishingTapEligibleAt = now + lastChosenTapIntervalMs;
+                    recordEvent("터치 간격 예약: " + lastChosenTapIntervalMs + "ms");
+                }
                 main.removeCallbacks(tapTimeout);
                 main.postDelayed(tapTimeout, GESTURE_TIMEOUT_MS);
             } else {
