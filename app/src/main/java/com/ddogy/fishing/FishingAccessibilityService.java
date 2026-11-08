@@ -8,6 +8,7 @@ import android.graphics.Path;
 import android.graphics.Rect;
 import android.content.ComponentName;
 import android.provider.Settings;
+import android.widget.Toast;
 import android.hardware.HardwareBuffer;
 import android.os.Handler;
 import android.os.Looper;
@@ -39,6 +40,7 @@ public class FishingAccessibilityService extends AccessibilityService {
     private static final String KAKAO = "com.kakao.talk";
     private static final String PREFS = "fishing_settings";
     private static final String USER_STARTED = "user_requested_running";
+    private static final String AUTO_FISH_PAUSED = "auto_fish_paused";
     private static final int OCR_TIMEOUT_MS = 9000;
     private static final int GESTURE_TIMEOUT_MS = 4000;
     private static final long STALL_MS = 3000;
@@ -62,6 +64,7 @@ public class FishingAccessibilityService extends AccessibilityService {
 
     private TextRecognizer recognizer;
     private boolean running;
+    private boolean autoFishPaused;
     private boolean scanning;
     private boolean tapping;
     private int scanToken;
@@ -91,6 +94,7 @@ public class FishingAccessibilityService extends AccessibilityService {
     private long verifiedGreyPairRows;
     private long blockedGreyRowRecoveries;
     private long fishThiefRecoveries;
+    private long autoFishNotices;
     private long lastRevealAt = -REVEAL_RETRY_MS;
     private int revealSwipes;
     private long noButtonSince;
@@ -183,6 +187,52 @@ public class FishingAccessibilityService extends AccessibilityService {
     public long getVerifiedGreyPairRows() { return verifiedGreyPairRows; }
     public long getBlockedGreyRowRecoveries() { return blockedGreyRowRecoveries; }
     public long getFishThiefRecoveries() { return fishThiefRecoveries; }
+    public long getAutoFishNotices() { return autoFishNotices; }
+    public boolean isAutoFishPaused() { return autoFishPaused; }
+
+    /**
+     * This does NOT reset the game. The user must complete any in-game
+     * manual steps and explicitly acknowledge them before re-enabling
+     * Fishing's start button.
+     */
+    public void acknowledgeManualReview() {
+        if (running) return;
+        autoFishPaused = false;
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+            .putBoolean(AUTO_FISH_PAUSED, false).apply();
+        recordEvent("수동 안내 확인 → 보호 정지 해제");
+        status = "안내 확인됨 · 사용자가 원하면 다시 시작할 수 있어요";
+    }
+
+    private boolean hasAutoFishNotice(Text recognized) {
+        StringBuilder all = new StringBuilder();
+        for (Text.TextBlock block : recognized.getTextBlocks()) {
+            all.append(block.getText().replaceAll("[^가-힣0-9]", ""));
+        }
+        String view = all.toString();
+        boolean autoFish = view.contains("자동어");
+        boolean notice = view.contains("자동어를낚")
+            || view.contains("자동어만나타")
+            || view.contains("자동흐름을끊")
+            || (view.contains("같은물길") && view.contains("계속"))
+            || (view.contains("수동을입력") && view.contains("낚시"));
+        return autoFish && notice;
+    }
+
+    private void pauseForAutoFish() {
+        if (!running || autoFishPaused) return;
+        stopRunning(); // Invalidates callbacks, timers and pending gestures.
+        autoFishPaused = true;
+        autoFishNotices++;
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+            .putBoolean(USER_STARTED, false)
+            .putBoolean(AUTO_FISH_PAUSED, true).apply();
+        status = "⛔ 자동어 감지 · 자동 낚시 중단 · 게임 안내에 따라 직접 '수동' 전환 필요";
+        recordEvent("자동어 감지 → 모든 자동 클릭/스크롤 정지");
+        Toast.makeText(getApplicationContext(),
+            "자동어가 감지돼 자동 낚시를 중단했어요. 카카오톡 게임 안내를 확인해 주세요.",
+            Toast.LENGTH_LONG).show();
+    }
     public long getSerializedGestures() { return serializedGestures; }
     public long getDeferredGestureActions() { return deferredGestureActions; }
 
@@ -242,7 +292,13 @@ public class FishingAccessibilityService extends AccessibilityService {
         active = this;
         recognizer = TextRecognition.getClient(
             new KoreanTextRecognizerOptions.Builder().build());
-        if (getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(USER_STARTED, false)) {
+        autoFishPaused = getSharedPreferences(PREFS, MODE_PRIVATE)
+            .getBoolean(AUTO_FISH_PAUSED, false);
+        if (autoFishPaused) {
+            getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                .putBoolean(USER_STARTED, false).apply();
+            status = "⛔ 자동어 보호 정지 · 게임에서 수동 전환 후 확인해 주세요";
+        } else if (getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(USER_STARTED, false)) {
             if (!getConflictingService().isEmpty()) {
                 running = false;
                 status = "이전 Fishing 접근성 서비스가 켜져 있어 자동 실행을 중지했어요";
@@ -276,6 +332,10 @@ public class FishingAccessibilityService extends AccessibilityService {
 
     public void startRunning() {
         if (running) return;
+        if (autoFishPaused) {
+            status = "⛔ 자동어 보호 정지: 카카오톡에서 수동 전환 후 앱에서 확인해야 해요";
+            return;
+        }
         String conflicting = getConflictingService();
         if (!conflicting.isEmpty()) {
             status = "기존 Fishing 도우미 접근성 서비스를 먼저 꺼 주세요: " + conflicting;
@@ -585,6 +645,13 @@ public class FishingAccessibilityService extends AccessibilityService {
         task.addOnSuccessListener(text -> {
             if (!running || id != scanToken) return;
             boolean inChat = visibleKakaoChat();
+            // The game has deliberately entered an anti-automation state.
+            // Never click through it, auto-enter "수동" or try to bypass it.
+            // This is checked before ANY fishing button or scroll handling.
+            if (inChat && hasAutoFishNotice(text)) {
+                pauseForAutoFish();
+                return;
+            }
             if (isFishingWebsite(text, image.getHeight()) && !hasKakaoChatComposer()) {
                 status = "낚시 웹페이지 감지 → 닫기/뒤로가기";
                 deferScanAction(id, () -> closeFishingWebsite(text, image));
