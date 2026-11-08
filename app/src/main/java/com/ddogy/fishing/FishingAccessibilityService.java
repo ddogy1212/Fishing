@@ -82,6 +82,8 @@ public class FishingAccessibilityService extends AccessibilityService {
     private long rescuedWebViews;
     private long revealedBottomButtons;
     private long blockedTextCandidates;
+    private long visualPairFallbacks;
+    private long mergedOcrPairs;
     private long lastRevealAt = -REVEAL_RETRY_MS;
     private int revealSwipes;
     private long noButtonSince;
@@ -161,6 +163,8 @@ public class FishingAccessibilityService extends AccessibilityService {
     public long getRescuedWebViews() { return rescuedWebViews; }
     public long getRevealedBottomButtons() { return revealedBottomButtons; }
     public long getBlockedTextCandidates() { return blockedTextCandidates; }
+    public long getVisualPairFallbacks() { return visualPairFallbacks; }
+    public long getMergedOcrPairs() { return mergedOcrPairs; }
 
     /**
      * Detect older installs of THIS project that may run a second
@@ -568,8 +572,14 @@ public class FishingAccessibilityService extends AccessibilityService {
 
             recordVisualFrame(image);
             int composerTop = findComposerTop(image.getHeight());
-            Target target = findFishing(text, image, composerTop);
-            if (target == null) target = findFishingFromNodes(image, composerTop);
+            // Always consider BOTH sources. If two fishing buttons are
+            // present, the lowest visible one is the newest message.
+            Target ocrTarget = findFishing(text, image, composerTop);
+            Target nodeTarget = findFishingFromNodes(image, composerTop);
+            Target target;
+            if (ocrTarget == null) target = nodeTarget;
+            else if (nodeTarget == null) target = ocrTarget;
+            else target = ocrTarget.y >= nodeTarget.y ? ocrTarget : nodeTarget;
             long now = SystemClock.uptimeMillis();
 
             if (target != null) {
@@ -988,15 +998,19 @@ public class FishingAccessibilityService extends AccessibilityService {
     private Target findFishing(Text result, Bitmap image, int composerTop) {
         ArrayList<Rect> fish = new ArrayList<>();
         ArrayList<Rect> companions = new ArrayList<>();
+        ArrayList<Rect> mergedRows = new ArrayList<>();
         for (Text.TextBlock block : result.getTextBlocks()) {
             for (Text.Line line : block.getLines()) {
+                String lineWords = line.getText().replaceAll("[^가-힣]", "");
                 if (isFishing(line.getText()) && line.getElements().size() <= 1)
                     fish.add(line.getBoundingBox());
+                // ML Kit sometimes merges "대결 낚시" into one element.
+                if (isMergedFishingRow(lineWords))
+                    mergedRows.add(line.getBoundingBox());
                 for (Text.Element element : line.getElements()) {
                     String label = element.getText();
                     if (isFishing(label)) fish.add(element.getBoundingBox());
-                    else if (isCompanion(label))
-                        companions.add(element.getBoundingBox());
+                    else if (isCompanion(label)) companions.add(element.getBoundingBox());
                 }
             }
         }
@@ -1015,17 +1029,107 @@ public class FishingAccessibilityService extends AccessibilityService {
                     break;
                 }
             }
-            // Gray background ALONE also appears in message bubbles. A
-            // neighboring action button is required to avoid tapping text.
-            if (!paired || !isGreyButton(image, r)) {
+            // The OCR text next door may be missing even though both real
+            // rounded gray buttons are plainly present. Require TWO
+            // isolated filled rectangles, including the bright gutter.
+            boolean visualPair = !paired && isTwoButtonRowByPixels(image, r);
+            if (!(paired || visualPair) || !isGreyButton(image, r)) {
                 blockedTextCandidates++;
                 continue;
             }
+            if (visualPair) visualPairFallbacks++;
             Target t = new Target(r.centerX(), r.centerY(),
                 r.centerX() < w / 2 ? "왼쪽" : "오른쪽");
             if (best == null || t.y > best.y) best = t;
         }
+
+        // If an entire row "강화 낚시" is recognized as one line, estimate
+        // the final label bounds and verify the actual dual-button pixels.
+        for (Rect row : mergedRows) {
+            if (row == null) continue;
+            String words = getMergedRowLabel(result, row);
+            boolean fishAtEnd = words.endsWith("낚시");
+            int labelWidth = Math.max(34, (int)(row.height() * 1.25));
+            Rect label = fishAtEnd
+                ? new Rect(row.right - labelWidth, row.top, row.right, row.bottom)
+                : new Rect(row.left, row.top, row.left + labelWidth, row.bottom);
+            if (!withinTouchableChat(label, w, h, composerTop)
+                || !isGreyButton(image, label)
+                || !isTwoButtonRowByPixels(image, label)) continue;
+            mergedOcrPairs++;
+            Target t = new Target(label.centerX(), label.centerY(),
+                label.centerX() < w/2 ? "왼쪽" : "오른쪽");
+            if (best == null || t.y > best.y) best = t;
+        }
         return best;
+    }
+
+    private boolean isMergedFishingRow(String words) {
+        return words.matches("(대결|강화|자랑하기)낚시|낚시(대결|강화|자랑하기)");
+    }
+
+    private String getMergedRowLabel(Text recognized, Rect bounds) {
+        for (Text.TextBlock b : recognized.getTextBlocks()) {
+            for (Text.Line line : b.getLines()) {
+                Rect r = line.getBoundingBox();
+                if (r != null && r.equals(bounds))
+                    return line.getText().replaceAll("[^가-힣]", "");
+            }
+        }
+        return "";
+    }
+
+    /**
+     * Pixel-backed fallback for a two-button row:
+     *  - fishing label is already recognized exactly;
+     *  - both large rounded button bodies are light gray;
+     *  - between them is a separate bright strip.
+     * A lone gray chat bubble cannot pass the gutter requirement.
+     */
+    private boolean isTwoButtonRowByPixels(Bitmap image, Rect fish) {
+        if (fish == null) return false;
+        int w = image.getWidth(), h = image.getHeight();
+        int x = fish.centerX(), y = fish.centerY();
+        if (y < h * .17 || y > h * .85) return false;
+        int shift = Math.round(w * .292f);
+        int radiusX = Math.max(28, Math.round(w * .078f));
+        int radiusY = Math.max(10, Math.round(h * .009f));
+        for (int direction : new int[]{-1, 1}) {
+            int otherX = x + direction * shift;
+            if (otherX < w * .14 || otherX > w * .86) continue;
+            int first = filledGreyCorners(image, x, y, radiusX, radiusY);
+            int second = filledGreyCorners(image, otherX, y, radiusX, radiusY);
+            if (first < 3 || second < 3) continue;
+
+            // In the sample Kakao card, there is a ~6px WHITE gap between
+            // the two 240-gray buttons. Search a narrow neighborhood to
+            // tolerate label and OCR bounding-box offsets.
+            int mid = (x + otherX) / 2;
+            boolean hasBrightGutter = false;
+            for (int dx=-10; dx<=10; dx+=2) {
+                int gx=mid+dx;
+                if (gx<1 || gx>=w-1) continue;
+                int color=image.getPixel(gx,y);
+                if (Color.red(color)>=252 && Color.green(color)>=252
+                    && Color.blue(color)>=252) {
+                    hasBrightGutter=true;
+                    break;
+                }
+            }
+            if (hasBrightGutter) return true;
+        }
+        return false;
+    }
+
+    private int filledGreyCorners(Bitmap image, int x, int y,
+            int rx, int ry) {
+        int count=0;
+        for (int dx : new int[]{-rx, rx}) {
+            for (int dy : new int[]{-ry, ry}) {
+                if (grey(image, x+dx, y+dy)) count++;
+            }
+        }
+        return count;
     }
 
     private boolean isFishing(String raw) {
