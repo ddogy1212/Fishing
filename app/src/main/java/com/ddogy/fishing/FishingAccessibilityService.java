@@ -172,6 +172,20 @@ public class FishingAccessibilityService extends AccessibilityService {
         task.addOnSuccessListener(result -> {
             if (!running) return;
             Target fishing = findFishing(result, frame);
+
+            // Check the popup close button before potentially tapping a
+            // still-visible old fishing card underneath a popup.
+            if (seenChat && !chatComposer) {
+                Target close = findCloseFromAccessibility(frame.getWidth(), frame.getHeight());
+                if (close == null) close = findCloseFromOcr(result, frame);
+                if (close == null) close = findCloseFromPixels(frame);
+                if (close != null) {
+                    status = "팝업 닫기(X) → 채팅 복귀";
+                    tap(close.x, close.y, false);
+                    return;
+                }
+            }
+
             if (fishing != null) {
                 seenChat = true;
                 status = "낚시 버튼 인식 (" + fishing.side + ") — 터치";
@@ -179,20 +193,9 @@ public class FishingAccessibilityService extends AccessibilityService {
                 return;
             }
 
-            // A popup may hide the composer and the fishing controls.
-            // Never tap an arbitrary top-left point: only a confirmed close target.
-            if (seenChat && !chatComposer) {
-                Target close = findCloseFromAccessibility(frame.getWidth(), frame.getHeight());
-                if (close == null) close = findCloseFromOcr(result, frame);
-                if (close != null) {
-                    status = "팝업 닫기(X) → 채팅 복귀";
-                    tap(close.x, close.y, false);
-                    return;
-                }
-                status = "팝업 의심: 닫기(X) 확인 불가, 안전하게 대기";
-            } else {
-                status = "회색 '낚시' 버튼을 찾는 중 (미인식 시 클릭 안 함)";
-            }
+            status = seenChat && !chatComposer
+                ? "팝업 의심: X 확인 불가, 안전하게 대기"
+                : "회색 '낚시' 버튼을 찾는 중 (미인식 시 클릭 안 함)";
         }).addOnFailureListener(e -> {
             if (running) status = "한글 문자 인식 실패 — 재시도";
         }).addOnCompleteListener(t -> {
@@ -327,6 +330,56 @@ public class FishingAccessibilityService extends AccessibilityService {
             }
         }
         return null;
+    }
+
+    /**
+     * Last resort for a graphic-only X icon which accessibility/OCR cannot read.
+     * Detect a high-contrast TWO-diagonal cross; a back arrow does not qualify.
+     * Restricted to the top-left corner and only used after a chat was seen.
+     */
+    private Target findCloseFromPixels(Bitmap bmp) {
+        int w = bmp.getWidth(), h = bmp.getHeight();
+        int bestScore = 0, bestX = -1, bestY = -1;
+        int fromX = Math.max(15, Math.round(w * .015f));
+        int toX = Math.min(Math.round(w * .24f), 180);
+        int fromY = Math.round(h * .045f);
+        int toY = Math.round(h * .235f);
+
+        for (int y = fromY; y < toY; y += 4) {
+            for (int x = fromX; x < toX; x += 4) {
+                int matched = 0, sumScore = 0, sign = 0;
+                for (int radius : new int[]{5, 8, 11}) {
+                    if (x - radius < 0 || x + radius >= w ||
+                            y - radius < 0 || y + radius >= h) continue;
+
+                    int diag = (light(bmp, x-radius, y-radius)
+                        + light(bmp, x+radius, y+radius)
+                        + light(bmp, x-radius, y+radius)
+                        + light(bmp, x+radius, y-radius)) / 4;
+                    int cardinal = (light(bmp, x-radius, y)
+                        + light(bmp, x+radius, y)
+                        + light(bmp, x, y-radius)
+                        + light(bmp, x, y+radius)) / 4;
+                    int delta = diag - cardinal;
+                    if (Math.abs(delta) >= 52 && (sign == 0 || (delta > 0 ? 1 : -1) == sign)) {
+                        matched++;
+                        sumScore += Math.abs(delta);
+                        sign = delta > 0 ? 1 : -1;
+                    }
+                }
+                if (matched >= 3 && sumScore > bestScore) {
+                    bestScore = sumScore;
+                    bestX = x;
+                    bestY = y;
+                }
+            }
+        }
+        return bestScore >= 190 ? new Target(bestX, bestY, "그림 X") : null;
+    }
+
+    private int light(Bitmap bmp, int x, int y) {
+        int c = bmp.getPixel(x, y);
+        return (Color.red(c) * 3 + Color.green(c) * 6 + Color.blue(c)) / 10;
     }
 
     private void tap(int x, int y, boolean fishing) {
