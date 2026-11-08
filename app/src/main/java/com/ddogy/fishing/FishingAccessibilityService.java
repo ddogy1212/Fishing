@@ -40,7 +40,9 @@ public class FishingAccessibilityService extends AccessibilityService {
     private static final int OCR_TIMEOUT_MS = 9000;
     private static final int GESTURE_TIMEOUT_MS = 4000;
     private static final long STALL_MS = 3000;
-    private static final long RETRY_OLDER_COOLDOWN_MS = 22000;
+    private static final long RETRY_OLDER_COOLDOWN_MS = 9000;
+    private static final long SESSION_WATCHDOG_MS = 12500;
+    private static final long HEARTBEAT_INTERVAL_MS = 2500;
     private static final int MAX_OLDER_SWIPES = 3;
     private final Handler main = new Handler(Looper.getMainLooper());
     private final Random random = new Random();
@@ -67,7 +69,71 @@ public class FishingAccessibilityService extends AccessibilityService {
     private int olderSwipes;
     private boolean returningToLatest;
     private int sessionId;
+    private long lastProgressAt;
+    private long watchdogRecoveries;
+    private String lastRecoveryReason = "없음";
+    private final ArrayDeque<String> recentEvents = new ArrayDeque<>();
     private String status = "준비 완료";
+
+    /**
+     * Unlike scanTimeout/tapTimeout, this is independent of the current
+     * operation. An early gesture precondition failure may leave
+     * returningToLatest=true with NO pending work. Always recover.
+     */
+    private final Runnable heartbeat = new Runnable() {
+        @Override public void run() {
+            if (!running) return;
+            long now = SystemClock.uptimeMillis();
+            if (lastProgressAt == 0) lastProgressAt = now;
+            if (now - lastProgressAt >= SESSION_WATCHDOG_MS) {
+                watchdogRecoveries++;
+                lastRecoveryReason = returningToLatest
+                    ? "스크롤 복귀 상태가 종료되지 않음"
+                    : (scanning ? "화면 인식 중단"
+                    : (tapping ? "제스처 응답 중단" : "다음 탐색 예약 누락"));
+                // Invalidate stale screenshot/OCR/gesture callbacks.
+                scanToken++;
+                gestureToken++;
+                sessionId++;
+                scanning = false;
+                tapping = false;
+                returningToLatest = false;
+                olderSwipes = 0;
+                noButtonSince = 0;
+                lastVisualSample = null;
+                lastProgressAt = now;
+                main.removeCallbacks(scanTimeout);
+                main.removeCallbacks(tapTimeout);
+                recordEvent("독립 복구: " + lastRecoveryReason);
+                status = "멈춤 감지 → 자동 재탐색 (" + watchdogRecoveries + "회)";
+                schedule(800);
+            }
+            main.postDelayed(this, HEARTBEAT_INTERVAL_MS);
+        }
+    };
+
+    private void recordProgress() {
+        lastProgressAt = SystemClock.uptimeMillis();
+    }
+
+    private void recordEvent(String value) {
+        if (recentEvents.size() >= 6) recentEvents.removeFirst();
+        recentEvents.addLast(value);
+    }
+
+    public String getRecentEvents() {
+        StringBuilder out = new StringBuilder();
+        for (String event : recentEvents) out.append("• ").append(event).append("\\n");
+        return out.toString();
+    }
+
+    public long getLastProgressAgeSeconds() {
+        return lastProgressAt == 0 ? 0
+            : Math.max(0, (SystemClock.uptimeMillis() - lastProgressAt) / 1000);
+    }
+
+    public long getWatchdogRecoveries() { return watchdogRecoveries; }
+    public String getLastRecoveryReason() { return lastRecoveryReason; }
 
     private final Runnable scanTimeout = () -> {
         if (!running || !scanning) return;
@@ -95,6 +161,9 @@ public class FishingAccessibilityService extends AccessibilityService {
             new KoreanTextRecognizerOptions.Builder().build());
         if (getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(USER_STARTED, false)) {
             running = true;
+            recordProgress();
+            main.removeCallbacks(heartbeat);
+            main.postDelayed(heartbeat, HEARTBEAT_INTERVAL_MS);
             status = "이전 실행 세션 복원 중";
             schedule(600);
         } else {
@@ -132,6 +201,11 @@ public class FishingAccessibilityService extends AccessibilityService {
         noButtonSince = 0;
         lastVisualChangeAt = 0;
         lastVisualSample = null;
+        lastSeekAt = -RETRY_OLDER_COOLDOWN_MS;
+        recordProgress();
+        main.removeCallbacks(heartbeat);
+        main.postDelayed(heartbeat, HEARTBEAT_INTERVAL_MS);
+        recordEvent("사용자 시작");
         status = "카카오톡 낚시 채팅방으로 이동하세요";
         schedule(450);
     }
@@ -152,6 +226,8 @@ public class FishingAccessibilityService extends AccessibilityService {
         main.removeCallbacks(ticker);
         main.removeCallbacks(scanTimeout);
         main.removeCallbacks(tapTimeout);
+        main.removeCallbacks(heartbeat);
+        recordEvent("사용자 중지");
         status = "중지됨";
     }
 
@@ -203,6 +279,7 @@ public class FishingAccessibilityService extends AccessibilityService {
 
     private void scanOnce() {
         if (!running || scanning || tapping || returningToLatest) return;
+        recordProgress();
         if (!onKakao()) {
             status = "카카오톡 화면 대기 중";
             schedule(950);
@@ -326,6 +403,7 @@ public class FishingAccessibilityService extends AccessibilityService {
         if (id != scanToken) return;
         scanning = false;
         main.removeCallbacks(scanTimeout);
+        recordProgress();
         schedule(delayMs);
     }
 
@@ -505,6 +583,7 @@ public class FishingAccessibilityService extends AccessibilityService {
             return;
         }
         lastSeekAt = SystemClock.uptimeMillis();
+        recordProgress();
         status = "낚시 버튼 없음 → 이전 메시지 탐색 ("
             + (olderSwipes + 1) + "/" + MAX_OLDER_SWIPES + ")";
         final int x = Math.round(w * .88f);
@@ -523,12 +602,20 @@ public class FishingAccessibilityService extends AccessibilityService {
         if (!running || returningToLatest || steps <= 0) return;
         returningToLatest = true;
         olderSwipes = 0;
+        recordProgress();
         status = "최신 메시지로 복귀";
         doReturnStep(steps, sessionId);
     }
 
     private void doReturnStep(int remaining, int session) {
-        if (!running || session != sessionId) return;
+        if (!running || session != sessionId) {
+            if (running) {
+                returningToLatest = false;
+                schedule(950);
+            }
+            return;
+        }
+        recordProgress();
         if (remaining <= 0) {
             returningToLatest = false;
             noButtonSince = SystemClock.uptimeMillis();
@@ -543,17 +630,25 @@ public class FishingAccessibilityService extends AccessibilityService {
             schedule(950);
             return;
         }
-        AccessibilityNodeInfo root = getRootInActiveWindow();
-        Rect bounds = new Rect();
-        root.getBoundsInScreen(bounds);
+        // No second accessibility root lookup here: Android may detach the
+        // window between checks, causing a NullPointerException. The guarded
+        // dispatch method checks the foreground chat again.
         // Gesture endpoints remain inside the chat region.
         int w = getResources().getDisplayMetrics().widthPixels;
         int h = getResources().getDisplayMetrics().heightPixels;
         int x = Math.round(w * .88f);
         int upper = Math.round(h * .38f);
         int lower = Math.round(h * .73f);
-        dispatchAction(x, lower, x, upper, 280, Action.SCROLL, () ->
-            main.postDelayed(() -> doReturnStep(remaining - 1, session), 300));
+        boolean dispatched = dispatchAction(x, lower, x, upper, 280,
+            Action.SCROLL, () -> main.postDelayed(
+                () -> doReturnStep(remaining - 1, session), 300));
+        if (!dispatched) {
+            returningToLatest = false;
+            olderSwipes = 0;
+            status = "스크롤 복귀 실패 → 탐색 상태 재설정";
+            recordEvent("복귀 제스처 미실행");
+            schedule(1100);
+        }
     }
 
     private Target findFishing(Text result, Bitmap image) {
@@ -678,11 +773,12 @@ public class FishingAccessibilityService extends AccessibilityService {
      * Every tap and swipe goes through one serial gesture dispatcher.
      * No second gesture starts until Android calls onCompleted/onCancelled.
      */
-    private void dispatchAction(int fromX, int fromY, int toX, int toY,
+    private boolean dispatchAction(int fromX, int fromY, int toX, int toY,
             long durationMs, Action action, Runnable success) {
-        if (!running || tapping || !onKakao()) return;
-        if (action != Action.CLOSE && !visibleKakaoChat()) return;
+        if (!running || tapping || !onKakao()) return false;
+        if (action != Action.CLOSE && !visibleKakaoChat()) return false;
         final int id = ++gestureToken;
+        recordProgress();
         tapping = true;
         main.removeCallbacks(ticker);
         Path path = new Path();
@@ -697,12 +793,14 @@ public class FishingAccessibilityService extends AccessibilityService {
                     if (id != gestureToken) return;
                     tapping = false;
                     main.removeCallbacks(tapTimeout);
+                    recordProgress();
                     if (!running) return;
                     if (action == Action.FISH) {
                         clicks++;
                         lastFishingTapAt = SystemClock.uptimeMillis();
                         lastVisualChangeAt = lastFishingTapAt;
                         status = "낚시 클릭 완료";
+                        recordEvent("낚시 버튼 터치 완료");
                         if (olderSwipes > 0) {
                             // New bot messages may appear while the chat is
                             // scrolled upward. Navigate back to newest.
@@ -735,6 +833,9 @@ public class FishingAccessibilityService extends AccessibilityService {
                     cancelledGestures++;
                     main.removeCallbacks(tapTimeout);
                     returningToLatest = false;
+                    olderSwipes = 0;
+                    recordProgress();
+                    recordEvent("제스처 취소");
                     if (running) {
                         status = "제스처 취소됨 → 잠시 후 재탐색";
                         schedule(1150);
@@ -749,6 +850,8 @@ public class FishingAccessibilityService extends AccessibilityService {
                 returningToLatest = false;
                 cancelledGestures++;
                 status = "제스처 전송 실패";
+                recordEvent("제스처 전송 실패");
+                recordProgress();
                 schedule(1050);
             }
         } catch (Exception error) {
@@ -756,8 +859,13 @@ public class FishingAccessibilityService extends AccessibilityService {
             returningToLatest = false;
             cancelledGestures++;
             status = "제스처 예외 → 재시도";
+            recordEvent("제스처 예외");
+            recordProgress();
             schedule(1100);
         }
+        // The caller receives a false result only if the operation could
+        // not even be attempted; immediate dispatch failure already reschedules.
+        return true;
     }
 
     private static final class Target {
