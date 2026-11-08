@@ -127,7 +127,9 @@ public class MainActivity extends Activity {
             "• 채팅 텍스트 '낚시'는 누르지 않음\n" +
             "• 하단 버튼이 입력창에 가려지면 채팅을 위로 스크롤 후 재탐색\n" +
             "• '낚시' 버튼 발견 시 스크롤을 멈추고 우선 클릭\n" +
-            "• 터치와 스크롤을 동시에 실행하지 않음\n" +
+            "• OCR 완료 이후에만 터치/스크롤 실행(서로 겹치지 않도록 직렬화)\n" +
+            "• 스크롤이 완료되면 0.65초 안정화 후 재탐색\n" +
+            "• 화면 상단의 낚시 버튼도 인식, 회색 버튼 후보가 있으면 스크롤보다 재인식 우선\n" +
             "• 12.5초 이상 작업 정지 시 독립 감시기가 자동 복구\n" +
             "• 다른 Fishing 버전 접근성 서비스가 켜져 있으면 중복 실행 방지\n" +
             "• 버튼을 찾지 못하면 클릭하지 않음\n" +
@@ -209,6 +211,8 @@ public class MainActivity extends Activity {
                   "회 · 텍스트 오인 차단 " + service.getBlockedTextCandidates() + "회\n" +
                   "회색 2버튼 보조 인식 " + service.getVisualPairFallbacks() +
                   "회 · 합쳐진 글자 인식 " + service.getMergedOcrPairs() + "회\n" +
+                  "완료된 제스처 " + service.getSerializedGestures() +
+                  "회 · OCR 후 대기 제스처 " + service.getDeferredGestureActions() + "회\n" +
                   "자동 멈춤 복구 " + service.getWatchdogRecoveries() + "회 · 마지막 간격 " +
                   service.getLastChosenTapIntervalMs() + "ms · 탐색 활동 " +
                   service.getLastProgressAgeSeconds() + "초 전\n" +
