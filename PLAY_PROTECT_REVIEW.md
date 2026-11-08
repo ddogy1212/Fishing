@@ -39,3 +39,19 @@
 - 화면 이미지와 OCR 데이터가 파일이나 네트워크에 저장/전송되지 않는지 코드 및 패키지 검사
 - 접근성 정책과 이용약관에 대한 검토
 
+
+
+## 제출할 최신 빌드의 확인된 정보
+
+- 앱 버전: Fishing 1.2.1 (`versionCode=4`)
+- APK 파일: `Fishing-v1.2.1.apk`
+- 파일 크기: 52,434,859 bytes
+- SHA-256: `e9962eec94239cc504b3cb6d5faa87cbd498a272b91b285d85a9b7b7681c980e`
+- 검증된 GitHub Actions 컴파일: https://github.com/ddogy1212/Fishing/actions/runs/42440013826
+- 코드를 공개한 저장소: https://github.com/ddogy1212/Fishing
+- 공식 차단 검토 접수: https://support.google.com/googleplay/android-developer/contact/protectappeals?hl=en
+
+### Google에 제출 가능한 검토 요청 (정책 준수 여부는 Google이 판단)
+
+> Hello Google Play Protect team. I am requesting a review of the installation block for Fishing, package com.ddogy.fishing, version 1.2.1. The displayed warning is "App blocked to protect your device" and states that the app may request access to sensitive information. Fishing is an explicitly user-started utility that uses Android AccessibilityService to detect a specific "낚시" button in an on-screen KakaoTalk game chat and automatically tap it, as well as perform limited recovery scrolling if the chat view stalls. The app provides a prominent disclosure and affirmative consent prompt, an explicit stop control, and restricts its accessibility-service configuration to the KakaoTalk package. Screen processing uses on-device Korean OCR. The app's own manifest does not request the INTERNET permission. We recognize the strong risk associated with sideloaded apps that use AccessibilityService and are requesting an accurate assessment, not an exception to or circumvention of device security controls. Source: https://github.com/ddogy1212/Fishing . APK SHA-256: e9962eec94239cc504b3cb6d5faa87cbd498a272b91b285d85a9b7b7681c980e .
+
