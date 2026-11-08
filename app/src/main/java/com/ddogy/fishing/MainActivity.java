@@ -61,7 +61,8 @@ public class MainActivity extends Activity {
 
         TextView disclosure = text(
             "권한 안내: 시작을 허용하면 Fishing은 실행 중인 카카오톡 화면을 읽어" +
-            " '낚시' 버튼만 인식하고 자동 터치합니다." +
+            " '낚시' 버튼을 찾아 터치하고, 버튼이 가려지면 채팅을 스크롤합니다." +
+            " 낚시 웹페이지가 열리면 확인된 닫기 버튼을 누를 수도 있습니다." +
             " 채팅에 표시된 내용이 화면 분석에 포함될 수 있습니다." +
             " 이 앱은 화면 데이터를 저장하거나 인터넷으로 전송하지 않습니다." +
             " 언제든 중지하거나 접근성 권한을 해제할 수 있습니다.",
@@ -102,8 +103,11 @@ public class MainActivity extends Activity {
             "• 인식 주기: 1.8~2.2초 랜덤(처리 시간은 별도)\n" +
             "• '낚시'라고 적힌 회색 버튼만 클릭\n" +
             "• 왼쪽/오른쪽 위치 자동 인식\n" +
-            "• 화면 스크롤과 팝업 닫기는 하지 않음\n" +
-            "• 이전 터치가 끝나야 다음 버튼을 다시 인식\n" +
+            "• '자랑하기 / 놓아준다' 결과 카드만 보이면 이전 메시지로 이동해 낚시 버튼 검색\n" +
+            "• 최대 3번 이전 메시지 탐색, 버튼 클릭 뒤 최신 메시지로 복귀\n" +
+            "• 낚시 웹페이지(couchfisher.com)가 열리면 X/뒤로 닫기\n" +
+            "• 화면 정지 3초 감지 시 짧게 위아래로 새로고침\n" +
+            "• 터치와 스크롤을 동시에 실행하지 않음\n" +
             "• 버튼을 찾지 못하면 클릭하지 않음\n" +
             "• 화면은 기기 안에서만 분석, 외부 전송 없음\n" +
             "• 카카오톡 외 다른 앱은 누르지 않음\n\n" +
@@ -119,10 +123,12 @@ public class MainActivity extends Activity {
     private void showDisclosure(Runnable onAccepted) {
         new AlertDialog.Builder(this)
             .setTitle("접근성 및 화면 분석 동의")
-            .setMessage("Fishing 앱은 낚시 버튼만 찾기 위해 " +
+            .setMessage("Fishing 앱은 낚시 버튼 인식, 결과 카드 후 이전 메시지 탐색," +
+                " 낚시 웹페이지 닫기와 채팅 새로고침을 위해 " +
                 "카카오톡에 표시된 화면과 UI 정보를 확인합니다. " +
                 "채팅에 보이는 다른 텍스트도 이 과정에서 화면 분석에 포함될 수 있습니다.\n\n" +
-                "사용자가 시작을 누른 뒤에만 확인된 '낚시' 버튼을 자동 터치합니다. " +
+                "사용자가 시작을 누른 뒤에만 확인된 '낚시' 버튼을 터치하고," +
+                " 버튼이 없으면 제한적으로 채팅을 스크롤하거나 낚시 웹페이지를 닫습니다. " +
                 "화면을 외부 서버로 전송하거나 저장하지 않으며, 기기 내부에서만 분석합니다.\n\n" +
                 "중지 버튼을 누르거나 접근성 설정에서 언제든 기능을 끌 수 있습니다. " +
                 "이 권한은 민감하므로 앱을 이해하고 동의할 때만 허용해 주세요.")
@@ -170,7 +176,8 @@ public class MainActivity extends Activity {
                 : "클릭 " + service.getClickCount() + "회 · 스캔 " + service.getScans() + "회\n" +
                   "미인식 " + service.getUnmatchedScans() + "회 · 캡처 오류 " +
                   service.getCaptureFailures() + "회 · 인식 지연 " + service.getTimeouts() + "회\n" +
-                  "자동 터치 취소 " +
+                  "복구 스크롤 " + service.getRecoveryCount() + "회 · 웹 닫기 " +
+                  service.getPopupsClosed() + "회 · 제스처 취소 " +
                   service.getCancelledGestures() + "회\n" +
                   service.getCurrentStatus());
         start.setEnabled(enabled && !running);
