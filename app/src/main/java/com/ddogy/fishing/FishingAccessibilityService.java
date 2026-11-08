@@ -623,6 +623,15 @@ public class FishingAccessibilityService extends AccessibilityService {
             }
 
             missed++;
+
+            // Do not scroll away from a plausible button merely because
+            // the OCR missed the OTHER button in the row. Stay on the screen
+            // and rescan until it is positively verified or disappears.
+            if (hasVisibleGreyFishingCandidate(text, image, composerTop)) {
+                noButtonSince = now;
+                status = "회색 낚시 버튼 후보 발견 → 스크롤 대신 재인식";
+                return;
+            }
             if (noButtonSince == 0) noButtonSince = now;
 
             // A result card is visible but its action row is underneath
@@ -1027,7 +1036,7 @@ public class FishingAccessibilityService extends AccessibilityService {
         // Reject notification banners, the message composer and system nav.
         int margin = Math.max(12, (int)(height * .01));
         return rect.left >= width * .10 && rect.right <= width * .91
-            && rect.top >= height * .16
+            && rect.top >= height * .115
             && rect.bottom < composerTop - margin
             && rect.height() <= height * .10
             && rect.width() <= width * .50;
@@ -1142,33 +1151,28 @@ public class FishingAccessibilityService extends AccessibilityService {
         if (fish == null) return false;
         int w = image.getWidth(), h = image.getHeight();
         int x = fish.centerX(), y = fish.centerY();
-        if (y < h * .17 || y > h * .85) return false;
-        int shift = Math.round(w * .292f);
-        int radiusX = Math.max(28, Math.round(w * .078f));
+        if (y < h * .12 || y > h * .85) return false;
+        int radiusX = Math.max(25, Math.round(w * .062f));
         int radiusY = Math.max(10, Math.round(h * .009f));
+        // Different device display sizes and OCR bounds place button labels
+        // at slightly different centers. Search a narrow geometry range
+        // rather than a single hardcoded 29.2% horizontal offset.
         for (int direction : new int[]{-1, 1}) {
-            int otherX = x + direction * shift;
-            if (otherX < w * .14 || otherX > w * .86) continue;
-            int first = filledGreyCorners(image, x, y, radiusX, radiusY);
-            int second = filledGreyCorners(image, otherX, y, radiusX, radiusY);
-            if (first < 3 || second < 3) continue;
-
-            // In the sample Kakao card, there is a ~6px WHITE gap between
-            // the two 240-gray buttons. Search a narrow neighborhood to
-            // tolerate label and OCR bounding-box offsets.
-            int mid = (x + otherX) / 2;
-            boolean hasBrightGutter = false;
-            for (int dx=-10; dx<=10; dx+=2) {
-                int gx=mid+dx;
-                if (gx<1 || gx>=w-1) continue;
-                int color=image.getPixel(gx,y);
-                if (Color.red(color)>=252 && Color.green(color)>=252
-                    && Color.blue(color)>=252) {
-                    hasBrightGutter=true;
-                    break;
+            for (float ratio : new float[]{.25f, .27f, .29f, .31f, .33f}) {
+                int otherX = x + direction * Math.round(w * ratio);
+                if (otherX < w * .14 || otherX > w * .86) continue;
+                int first = filledGreyCorners(image, x, y, radiusX, radiusY);
+                int second = filledGreyCorners(image, otherX, y, radiusX, radiusY);
+                if (first < 3 || second < 3) continue;
+                int mid = (x + otherX) / 2;
+                for (int dx = -13; dx <= 13; dx += 2) {
+                    int gx = mid + dx;
+                    if (gx < 1 || gx >= w - 1) continue;
+                    int color = image.getPixel(gx, y);
+                    if (Color.red(color) >= 250 && Color.green(color) >= 250
+                        && Color.blue(color) >= 250) return true;
                 }
             }
-            if (hasBrightGutter) return true;
         }
         return false;
     }
@@ -1182,6 +1186,25 @@ public class FishingAccessibilityService extends AccessibilityService {
             }
         }
         return count;
+    }
+
+    private boolean hasVisibleGreyFishingCandidate(Text result, Bitmap image,
+            int composerTop) {
+        int w = image.getWidth(), h = image.getHeight();
+        for (Text.TextBlock block : result.getTextBlocks()) {
+            for (Text.Line line : block.getLines()) {
+                Rect lr = line.getBoundingBox();
+                if (isFishing(line.getText()) && withinTouchableChat(lr, w, h, composerTop)
+                    && isGreyButton(image, lr)) return true;
+                for (Text.Element element : line.getElements()) {
+                    Rect r = element.getBoundingBox();
+                    if (isFishing(element.getText())
+                        && withinTouchableChat(r, w, h, composerTop)
+                        && isGreyButton(image, r)) return true;
+                }
+            }
+        }
+        return false;
     }
 
     private boolean isFishing(String raw) {
