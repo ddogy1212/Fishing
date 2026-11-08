@@ -34,10 +34,23 @@ public class FishingAccessibilityService extends AccessibilityService {
     private static final String KAKAO_PACKAGE = "com.kakao.talk";
     private static final int MIN_INTERVAL_MS = 1800;
     private static final int MAX_INTERVAL_MS = 2200;
+    private static final String PREFS = "fishing_settings";
+    private static final String WANTED = "user_requested_running";
+    private static final long SCAN_TIMEOUT_MS = 9000;
 
     private final Handler main = new Handler(Looper.getMainLooper());
     private final Random random = new Random();
     private final Runnable ticker = this::scanOnce;
+    private final Runnable watchdog = () -> {
+        if (!running || !working) return;
+        // OCR and screenshot callbacks do not have a guaranteed deadline.
+        // Discard stale callback work, then schedule a fresh scan.
+        scanToken++;
+        working = false;
+        scanTimeouts++;
+        status = "화면 인식 지연 복구 중 (" + scanTimeouts + "회)";
+        schedule(650);
+    };
 
     private TextRecognizer recognizer;
     private boolean running = false;
@@ -45,6 +58,11 @@ public class FishingAccessibilityService extends AccessibilityService {
     private boolean seenChat = false;
     private long clicks = 0;
     private long lastTapAt = 0;
+    private int scanToken = 0;
+    private long scans = 0;
+    private long scanTimeouts = 0;
+    private long captureFailures = 0;
+    private long unmatchedScans = 0;
     private String status = "준비 완료";
 
     @Override protected void onServiceConnected() {
@@ -52,6 +70,13 @@ public class FishingAccessibilityService extends AccessibilityService {
         active = this;
         recognizer = TextRecognition.getClient(new KoreanTextRecognizerOptions.Builder().build());
         status = "준비 완료";
+        if (getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(WANTED, false)) {
+            // The process may be reclaimed without onDestroy. Resume only if
+            // the user had explicitly started a session earlier.
+            running = true;
+            status = "이전 자동 낚시 세션 복원 중";
+            schedule(500);
+        }
     }
 
     @Override public void onAccessibilityEvent(AccessibilityEvent event) {
@@ -59,11 +84,23 @@ public class FishingAccessibilityService extends AccessibilityService {
     }
 
     @Override public void onInterrupt() {
-        stopRunning();
+        // A temporary accessibility interruption is NOT an explicit user stop.
+        // The next scan will re-check the foreground app before any tap.
+        if (running) {
+            status = "접근성 일시 중단 — 자동 복구 확인 중";
+            if (!working) schedule(800);
+        }
     }
 
     @Override public void onDestroy() {
-        stopRunning();
+        running = false;
+        working = false;
+        scanToken++;
+        main.removeCallbacks(ticker);
+        main.removeCallbacks(watchdog);
+        // A deliberate accessibility-service shutdown must not secretly
+        // restart automation when the permission is re-enabled later.
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean(WANTED, false).apply();
         if (recognizer != null) recognizer.close();
         if (active == this) active = null;
         super.onDestroy();
@@ -71,22 +108,32 @@ public class FishingAccessibilityService extends AccessibilityService {
 
     public void startRunning() {
         if (running) return;
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean(WANTED, true).apply();
         running = true;
         working = false;
         seenChat = false;
+        scanToken++;
+        lastTapAt = 0;
         status = "카카오톡 낚시 채팅 화면으로 이동하세요";
         schedule(300);
     }
 
     public void stopRunning() {
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean(WANTED, false).apply();
         running = false;
         working = false;
+        scanToken++;
         main.removeCallbacks(ticker);
-        status = "중지했습니다";
+        main.removeCallbacks(watchdog);
+        status = "사용자가 중지했습니다";
     }
 
     public boolean isRunning() { return running; }
     public long getClickCount() { return clicks; }
+    public long getScans() { return scans; }
+    public long getTimeouts() { return scanTimeouts; }
+    public long getCaptureFailures() { return captureFailures; }
+    public long getUnmatchedScans() { return unmatchedScans; }
     public String getCurrentStatus() { return status; }
 
     private void schedule(long ms) {
@@ -117,14 +164,21 @@ public class FishingAccessibilityService extends AccessibilityService {
         }
 
         working = true;
+        scans++;
+        int token = ++scanToken;
+        main.removeCallbacks(watchdog);
+        main.postDelayed(watchdog, SCAN_TIMEOUT_MS);
         boolean chatComposer = containsChatComposer(root);
         try {
             takeScreenshot(Display.DEFAULT_DISPLAY, getMainExecutor(),
                 new TakeScreenshotCallback() {
                     @Override public void onSuccess(ScreenshotResult shot) {
-                        if (!running) { working = false; return; }
-                        Bitmap copy = null;
                         HardwareBuffer buffer = shot.getHardwareBuffer();
+                        if (!running || token != scanToken) {
+                            if (buffer != null) buffer.close();
+                            return;
+                        }
+                        Bitmap copy = null;
                         try {
                             Bitmap hardware = Bitmap.wrapHardwareBuffer(buffer, shot.getColorSpace());
                             if (hardware != null) {
@@ -134,44 +188,56 @@ public class FishingAccessibilityService extends AccessibilityService {
                         } catch (Exception e) {
                             status = "화면 가져오기 실패: " + e.getClass().getSimpleName();
                         } finally {
-                            buffer.close();
+                            if (buffer != null) buffer.close();
                         }
                         if (copy == null) {
-                            working = false;
-                            schedule(1100);
+                            captureFailures++;
+                            finishScan(token, 1100);
                             return;
                         }
-                        analyze(copy, chatComposer);
+                        analyze(copy, chatComposer, token);
                     }
 
                     @Override public void onFailure(int errorCode) {
-                        working = false;
+                        if (!running || token != scanToken) return;
+                        captureFailures++;
                         status = "화면 캡처 실패 (" + errorCode + ") — 재시도";
-                        schedule(1400);
+                        finishScan(token, 1150);
                     }
                 });
         } catch (Exception e) {
-            working = false;
-            status = "스크린샷 기능을 사용할 수 없어요";
-            schedule(1500);
+            captureFailures++;
+            status = "스크린샷 예외 — 재시도";
+            finishScan(token, 1200);
         }
     }
 
-    private void analyze(Bitmap frame, boolean chatComposer) {
+    private void finishScan(int token, long retryWait) {
+        if (token != scanToken) return;
+        working = false;
+        main.removeCallbacks(watchdog);
+        if (running) {
+            if (retryWait > 0) schedule(retryWait);
+            else nextCycle();
+        }
+    }
+
+    private void analyze(Bitmap frame, boolean chatComposer, int token) {
         Task<Text> task;
         try {
             task = recognizer.process(InputImage.fromBitmap(frame, 0));
         } catch (Exception e) {
             frame.recycle();
-            working = false;
-            status = "문자 인식 시작 실패";
-            schedule(1300);
+            status = "문자 인식 시작 실패 — 재시도";
+            finishScan(token, 1150);
             return;
         }
 
         task.addOnSuccessListener(result -> {
-            if (!running) return;
+            if (!running || token != scanToken) return;
             Target fishing = findFishing(result, frame);
+            // Accessibility nodes are a backup when OCR misses the '낚시' text.
+            if (fishing == null) fishing = findFishingFromAccessibility(frame);
 
             // Check the popup close button before potentially tapping a
             // still-visible old fishing card underneath a popup.
@@ -193,15 +259,16 @@ public class FishingAccessibilityService extends AccessibilityService {
                 return;
             }
 
+            unmatchedScans++;
             status = seenChat && !chatComposer
-                ? "팝업 의심: X 확인 불가, 안전하게 대기"
-                : "회색 '낚시' 버튼을 찾는 중 (미인식 시 클릭 안 함)";
+                ? "팝업 의심: X 확인 불가, 재탐색 (" + unmatchedScans + ")"
+                : "'낚시' 버튼 다시 탐색 중 (" + unmatchedScans + "회)";
         }).addOnFailureListener(e -> {
-            if (running) status = "한글 문자 인식 실패 — 재시도";
+            if (running && token == scanToken)
+                status = "한글 인식 실패 — 안전하게 재시도";
         }).addOnCompleteListener(t -> {
-            frame.recycle();
-            working = false;
-            if (running) nextCycle();
+            if (!frame.isRecycled()) frame.recycle();
+            finishScan(token, 0);
         });
     }
 
@@ -212,23 +279,88 @@ public class FishingAccessibilityService extends AccessibilityService {
 
         for (Text.TextBlock block : text.getTextBlocks()) {
             for (Text.Line line : block.getLines()) {
+                // ML Kit sometimes combines/splits the characters across
+                // elements. Checking the full line catches these cases.
+                if ("낚시".equals(line.getText().replaceAll("[^가-힣]", ""))) {
+                    best = chooseFishingRect(frame, line.getBoundingBox(), best);
+                }
                 for (Text.Element element : line.getElements()) {
-                    String cleaned = element.getText().replaceAll("[^가-힣]", "");
-                    if (!"낚시".equals(cleaned)) continue;
-                    Rect r = element.getBoundingBox();
-                    if (r == null || r.width() <= 6 || r.height() <= 6) continue;
-
-                    int cx = r.centerX(), cy = r.centerY();
-                    // Exclude heading texts, chat mentions and the keyboard area.
-                    if (cy < h * 0.20 || cy > h * 0.91) continue;
-                    if (cx < w * 0.11 || cx > w * 0.90) continue;
-                    if (!looksLikeGreyButton(frame, r)) continue;
-
-                    // Select the latest (lowest) visible button, not old chat cards.
-                    if (best == null || cy > best.y) {
-                        best = new Target(cx, cy, cx < w / 2 ? "왼쪽" : "오른쪽");
+                    if ("낚시".equals(element.getText().replaceAll("[^가-힣]", ""))) {
+                        best = chooseFishingRect(frame, element.getBoundingBox(), best);
                     }
                 }
+            }
+        }
+        return best;
+    }
+
+    private Target chooseFishingRect(Bitmap frame, Rect r, Target best) {
+        if (r == null || r.width() <= 6 || r.height() <= 6) return best;
+        int w = frame.getWidth(), h = frame.getHeight();
+        int cx = r.centerX(), cy = r.centerY();
+        if (cy < h * 0.20 || cy > h * 0.91) return best;
+        if (cx < w * 0.11 || cx > w * 0.90) return best;
+        if (!looksLikeGreyButton(frame, r)) return best;
+        if (best == null || cy > best.y)
+            return new Target(cx, cy, cx < w / 2 ? "왼쪽" : "오른쪽");
+        return best;
+    }
+
+    /**
+     * Fallback for WebView/Chat UI buttons exposed through accessibility,
+     * even if on-device OCR misses their characters. Requires a same-row
+     * companion labeled '대결' or '강화'; no arbitrary coordinate guessing.
+     */
+    private Target findFishingFromAccessibility(Bitmap frame) {
+        AccessibilityNodeInfo root = getRootInActiveWindow();
+        if (root == null || root.getPackageName() == null
+            || !KAKAO_PACKAGE.contentEquals(root.getPackageName())) return null;
+
+        ArrayDeque<AccessibilityNodeInfo> todo = new ArrayDeque<>();
+        java.util.ArrayList<Rect> fishing = new java.util.ArrayList<>();
+        java.util.ArrayList<Rect> peers = new java.util.ArrayList<>();
+        todo.add(root);
+        int visited = 0, w = frame.getWidth(), h = frame.getHeight();
+        while (!todo.isEmpty() && visited++ < 1000) {
+            AccessibilityNodeInfo node = todo.removeFirst();
+            if (node.isVisibleToUser()) {
+                String value = node.getText() == null ? "" : node.getText().toString().trim();
+                String desc = node.getContentDescription() == null ? ""
+                    : node.getContentDescription().toString().trim();
+                Rect bounds = new Rect();
+                node.getBoundsInScreen(bounds);
+                if (bounds.width() > 10 && bounds.width() < w * .52
+                    && bounds.height() > 10 && bounds.height() < h * .11
+                    && bounds.centerX() > w * .10 && bounds.centerX() < w * .91
+                    && bounds.centerY() > h * .20 && bounds.centerY() < h * .91) {
+                    if ("낚시".equals(value) || "낚시".equals(desc))
+                        fishing.add(bounds);
+                    if ("대결".equals(value) || "강화".equals(value)
+                        || "대결".equals(desc) || "강화".equals(desc))
+                        peers.add(bounds);
+                }
+            }
+            for (int i = 0; i < node.getChildCount(); i++) {
+                AccessibilityNodeInfo child = node.getChild(i);
+                if (child != null) todo.addLast(child);
+            }
+        }
+
+        Target best = null;
+        for (Rect r : fishing) {
+            boolean paired = false;
+            for (Rect peer : peers) {
+                int dy = Math.abs(peer.centerY() - r.centerY());
+                int dx = Math.abs(peer.centerX() - r.centerX());
+                if (dy <= Math.max(24, h * .02) && dx > 45 && dx < w * .55) {
+                    paired = true;
+                    break;
+                }
+            }
+            if (paired && looksLikeGreyButton(frame, r)) {
+                Target t = new Target(r.centerX(), r.centerY(),
+                    r.centerX() < w / 2 ? "왼쪽 (접근성)" : "오른쪽 (접근성)");
+                if (best == null || t.y > best.y) best = t;
             }
         }
         return best;
