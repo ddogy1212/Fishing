@@ -42,7 +42,8 @@ public class FishingAccessibilityService extends AccessibilityService {
     private static final int OCR_TIMEOUT_MS = 9000;
     private static final int GESTURE_TIMEOUT_MS = 4000;
     private static final long STALL_MS = 3000;
-    private static final long RETRY_OLDER_COOLDOWN_MS = 20000;
+    private static final long RETRY_OLDER_COOLDOWN_MS = 9000;
+    private static final long UNRESOLVED_BUTTON_TIMEOUT_MS = 6500;
     private static final long SESSION_WATCHDOG_MS = 12500;
     private static final long HEARTBEAT_INTERVAL_MS = 2500;
     private static final long SCROLL_SETTLE_MS = 650;
@@ -88,6 +89,8 @@ public class FishingAccessibilityService extends AccessibilityService {
     private long focusedOcrAttempts;
     private long focusedOcrMatches;
     private long verifiedGreyPairRows;
+    private long blockedGreyRowRecoveries;
+    private long fishThiefRecoveries;
     private long lastRevealAt = -REVEAL_RETRY_MS;
     private int revealSwipes;
     private long noButtonSince;
@@ -178,6 +181,8 @@ public class FishingAccessibilityService extends AccessibilityService {
     public long getFocusedOcrAttempts() { return focusedOcrAttempts; }
     public long getFocusedOcrMatches() { return focusedOcrMatches; }
     public long getVerifiedGreyPairRows() { return verifiedGreyPairRows; }
+    public long getBlockedGreyRowRecoveries() { return blockedGreyRowRecoveries; }
+    public long getFishThiefRecoveries() { return fishThiefRecoveries; }
     public long getSerializedGestures() { return serializedGestures; }
     public long getDeferredGestureActions() { return deferredGestureActions; }
 
@@ -694,8 +699,10 @@ public class FishingAccessibilityService extends AccessibilityService {
         if (count >= 4) centers.add(sum / count);
         // Newest messages (lowest screen position) first.
         java.util.Collections.sort(centers, java.util.Collections.reverseOrder());
-        if (centers.size() > 3)
-            return new ArrayList<>(centers.subList(0, 3));
+        // A bounded fallback: two most recent rows are enough for a single
+        // screenshot. More successive OCR tasks risk hitting scan timeout.
+        if (centers.size() > 2)
+            return new ArrayList<>(centers.subList(0, 2));
         return centers;
     }
 
@@ -798,47 +805,87 @@ public class FishingAccessibilityService extends AccessibilityService {
         return null;
     }
 
+    /**
+     * A fishing thief/event card can contain two gray buttons WITHOUT a
+     * "낚시" choice. Do not confuse its visual geometry with a fishing button.
+     * The old implementation reset noButtonSince on EVERY failed OCR pass,
+     * so the elapsed timeout could never expire. That left the app frozen.
+     */
+    private boolean isFishThiefEvent(Text recognized) {
+        StringBuilder words = new StringBuilder();
+        for (Text.TextBlock block : recognized.getTextBlocks()) {
+            words.append(block.getText().replaceAll("[^가-힣]", ""));
+        }
+        String normalized = words.toString();
+        return normalized.contains("물고기도둑")
+            || normalized.contains("물고기절도")
+            || normalized.contains("물고기를훔")
+            || normalized.contains("도둑이")
+            || normalized.contains("도둑질");
+    }
+
     private void handleNoFishingButton(Text text, Bitmap image, int id,
             int composerTop, boolean visibleGrayRows) {
         if (!running || id != scanToken) return;
         missed++;
         long now = SystemClock.uptimeMillis();
-        boolean resultChoices = hasResultChoices(text);
-        // A visible 2-button row might be an OCR miss. Do not make the
-        // user's screen bounce while the button is plainly there.
-        if (visibleGrayRows && !resultChoices) {
-            noButtonSince = now;
-            status = "회색 버튼 줄 확인 → 글자 재검사, 스크롤 보류";
-            return;
-        }
-        if (hasVisibleGreyFishingCandidate(text, image, composerTop)) {
-            noButtonSince = now;
-            status = "회색 낚시 후보 → 스크롤 보류";
-            return;
-        }
+        // Only start this clock once. It must survive repeated OCR attempts,
+        // including when gray buttons are visible but NOT labeled fishing.
         if (noButtonSince == 0) noButtonSince = now;
-        if (shouldRevealBottomCard(text, image, composerTop)) {
+        long unresolvedMs = now - noButtonSince;
+        boolean resultChoices = hasResultChoices(text);
+        boolean thiefEvent = isFishThiefEvent(text);
+        boolean greyCandidate = hasVisibleGreyFishingCandidate(text, image, composerTop);
+        boolean timedOut = unresolvedMs >= UNRESOLVED_BUTTON_TIMEOUT_MS;
+
+        // Give uncertain OCR a short bounded opportunity to re-check the
+        // real button. Never keep waiting forever on non-fishing events.
+        if ((visibleGrayRows || greyCandidate)
+            && !resultChoices && !thiefEvent && !timedOut) {
+            status = "회색 버튼 재인식 중 (" + (unresolvedMs / 1000)
+                + "초 / 최대 6.5초)";
+            return;
+        }
+
+        if ((visibleGrayRows || greyCandidate) && timedOut) {
+            blockedGreyRowRecoveries++;
+            recordEvent("회색 버튼 인식 한계 도달 → 이전 메시지 탐색");
+        }
+
+        // The fixed chat composer may cover the actual bottom action row.
+        // Reveal it only a bounded number of times. After exhausting those
+        // attempts, continue to ordinary recovery instead of returning
+        // forever from this branch.
+        if (!resultChoices && !thiefEvent
+            && shouldRevealBottomCard(text, image, composerTop)) {
             if (revealSwipes < MAX_REVEAL_SWIPES
                 && now - lastRevealAt >= REVEAL_RETRY_MS) {
                 final int width = image.getWidth(), height = image.getHeight();
                 deferScanAction(id, () -> revealBottomCard(width, height, composerTop));
-            } else {
-                status = "가려진 버튼 표시 여부 다시 확인 중";
+                return;
             }
-            return;
+            if (!timedOut) {
+                status = "하단 가림 복구 대기 → 낚시 버튼 재확인";
+                return;
+            }
+            recordEvent("하단 버튼 가림 복구 횟수 초과 → 이전 메시지 탐색");
         }
-        // Only search older chat when a result card definitely has NO
-        // fishing action, or after a sustained empty-screen timeout.
-        boolean emptyForLongTime = now - noButtonSince >= 12000;
-        boolean shouldSeek = resultChoices || olderSwipes > 0 || emptyForLongTime;
+
+        // Fish-thief and choice-only result cards contain no verified fishing
+        // button on this view. Seek an earlier actual fishing button.
+        boolean shouldSeek = thiefEvent || resultChoices || olderSwipes > 0 || timedOut;
         if (shouldSeek && (olderSwipes > 0
             || now - lastSeekAt >= RETRY_OLDER_COOLDOWN_MS)) {
+            if (thiefEvent) {
+                fishThiefRecoveries++;
+                recordEvent("물고기 도둑 이벤트 → 이전 낚시 버튼 탐색");
+            }
             final int width = image.getWidth(), height = image.getHeight();
             deferScanAction(id, () -> searchOlderButton(width, height));
         } else {
-            status = resultChoices
-                ? "결과 카드: 이전 메시지 탐색 대기"
-                : "낚시 버튼 없음 → 천천히 재확인";
+            status = thiefEvent ? "도둑 이벤트 → 스크롤 재시도 대기"
+                : resultChoices ? "낚시 버튼 없는 결과 카드 → 재탐색 대기"
+                : "낚시 버튼 재인식 중 (" + (unresolvedMs / 1000) + "초)";
         }
     }
 
