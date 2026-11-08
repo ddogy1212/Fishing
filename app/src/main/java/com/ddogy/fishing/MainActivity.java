@@ -61,7 +61,7 @@ public class MainActivity extends Activity {
 
         TextView disclosure = text(
             "권한 안내: 시작을 허용하면 Fishing은 실행 중인 카카오톡 화면을 읽어" +
-            " '낚시'와 팝업의 X 버튼을 인식하고 화면을 자동 터치합니다." +
+            " '낚시' 버튼만 인식하고 자동 터치합니다." +
             " 채팅에 표시된 내용이 화면 분석에 포함될 수 있습니다." +
             " 이 앱은 화면 데이터를 저장하거나 인터넷으로 전송하지 않습니다." +
             " 언제든 중지하거나 접근성 권한을 해제할 수 있습니다.",
@@ -102,8 +102,8 @@ public class MainActivity extends Activity {
             "• 인식 주기: 1.8~2.2초 랜덤(처리 시간은 별도)\n" +
             "• '낚시'라고 적힌 회색 버튼만 클릭\n" +
             "• 왼쪽/오른쪽 위치 자동 인식\n" +
-            "• 채팅 화면이 3초 이상 그대로면 위·아래로 살짝 스크롤 후 다시 인식\n" +
-            "• 터치와 스크롤은 순서대로 실행해 충돌 방지\n" +
+            "• 화면 스크롤과 팝업 닫기는 하지 않음\n" +
+            "• 이전 터치가 끝나야 다음 버튼을 다시 인식\n" +
             "• 버튼을 찾지 못하면 클릭하지 않음\n" +
             "• 화면은 기기 안에서만 분석, 외부 전송 없음\n" +
             "• 카카오톡 외 다른 앱은 누르지 않음\n\n" +
@@ -119,10 +119,10 @@ public class MainActivity extends Activity {
     private void showDisclosure(Runnable onAccepted) {
         new AlertDialog.Builder(this)
             .setTitle("접근성 및 화면 분석 동의")
-            .setMessage("Fishing 앱은 낚시 버튼과 팝업 닫기 버튼을 찾기 위해 " +
+            .setMessage("Fishing 앱은 낚시 버튼만 찾기 위해 " +
                 "카카오톡에 표시된 화면과 UI 정보를 확인합니다. " +
                 "채팅에 보이는 다른 텍스트도 이 과정에서 화면 분석에 포함될 수 있습니다.\n\n" +
-                "사용자가 시작을 누른 뒤에만 '낚시' 또는 확인된 팝업 닫기 버튼을 자동 터치합니다. " +
+                "사용자가 시작을 누른 뒤에만 확인된 '낚시' 버튼을 자동 터치합니다. " +
                 "화면을 외부 서버로 전송하거나 저장하지 않으며, 기기 내부에서만 분석합니다.\n\n" +
                 "중지 버튼을 누르거나 접근성 설정에서 언제든 기능을 끌 수 있습니다. " +
                 "이 권한은 민감하므로 앱을 이해하고 동의할 때만 허용해 주세요.")
@@ -170,7 +170,7 @@ public class MainActivity extends Activity {
                 : "클릭 " + service.getClickCount() + "회 · 스캔 " + service.getScans() + "회\n" +
                   "미인식 " + service.getUnmatchedScans() + "회 · 캡처 오류 " +
                   service.getCaptureFailures() + "회 · 인식 지연 " + service.getTimeouts() + "회\n" +
-                  "멈춤 자동 복구 " + service.getRecoveryCount() + "회 · 제스처 취소 " +
+                  "자동 터치 취소 " +
                   service.getCancelledGestures() + "회\n" +
                   service.getCurrentStatus());
         start.setEnabled(enabled && !running);
