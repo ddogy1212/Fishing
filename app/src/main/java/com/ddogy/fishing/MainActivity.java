@@ -102,6 +102,8 @@ public class MainActivity extends Activity {
             "• 인식 주기: 1.8~2.2초 랜덤(처리 시간은 별도)\n" +
             "• '낚시'라고 적힌 회색 버튼만 클릭\n" +
             "• 왼쪽/오른쪽 위치 자동 인식\n" +
+            "• 채팅 화면이 3초 이상 그대로면 위·아래로 살짝 스크롤 후 다시 인식\n" +
+            "• 터치와 스크롤은 순서대로 실행해 충돌 방지\n" +
             "• 버튼을 찾지 못하면 클릭하지 않음\n" +
             "• 화면은 기기 안에서만 분석, 외부 전송 없음\n" +
             "• 카카오톡 외 다른 앱은 누르지 않음\n\n" +
@@ -167,7 +169,9 @@ public class MainActivity extends Activity {
                 ? "Fishing 도우미가 비활성 상태입니다."
                 : "클릭 " + service.getClickCount() + "회 · 스캔 " + service.getScans() + "회\n" +
                   "미인식 " + service.getUnmatchedScans() + "회 · 캡처 오류 " +
-                  service.getCaptureFailures() + "회 · 지연 복구 " + service.getTimeouts() + "회\n" +
+                  service.getCaptureFailures() + "회 · 인식 지연 " + service.getTimeouts() + "회\n" +
+                  "멈춤 자동 복구 " + service.getRecoveryCount() + "회 · 제스처 취소 " +
+                  service.getCancelledGestures() + "회\n" +
                   service.getCurrentStatus());
         start.setEnabled(enabled && !running);
         start.setAlpha(enabled && !running ? 1f : 0.5f);
