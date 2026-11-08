@@ -2,6 +2,15 @@ plugins {
     id 'com.android.application'
 }
 
+// The signing key is NEVER checked into the public repository.
+// GitHub Actions sets these environment variables from repository secrets.
+def releaseKeystore = System.getenv('FISHING_KEYSTORE_PATH')
+def releaseStorePassword = System.getenv('FISHING_STORE_PASSWORD')
+def releaseAlias = System.getenv('FISHING_KEY_ALIAS')
+def releaseKeyPassword = System.getenv('FISHING_KEY_PASSWORD')
+def canSignRelease = [releaseKeystore, releaseStorePassword, releaseAlias,
+                       releaseKeyPassword].every { it != null && !it.isEmpty() }
+
 android {
     namespace 'com.ddogy.fishing'
     compileSdk 35
@@ -10,8 +19,31 @@ android {
         applicationId 'com.ddogy.fishing'
         minSdk 30
         targetSdk 35
-        versionCode 3
-        versionName '1.2.0'
+        versionCode 4
+        versionName '1.2.1'
+    }
+
+    signingConfigs {
+        release {
+            if (canSignRelease) {
+                storeFile file(releaseKeystore)
+                storePassword releaseStorePassword
+                keyAlias releaseAlias
+                keyPassword releaseKeyPassword
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            if (canSignRelease) {
+                signingConfig signingConfigs.release
+            }
+        }
+        debug {
+            debuggable true
+        }
     }
 
     compileOptions {
