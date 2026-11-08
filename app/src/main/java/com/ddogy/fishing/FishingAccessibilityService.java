@@ -470,7 +470,9 @@ public class FishingAccessibilityService extends AccessibilityService {
             schedule(900);
             return;
         }
-        if (visibleKakaoChat()) observedChat();
+        // Only count an explicitly visible Kakao chat composer as a
+        // verified return. A hidden composer behind a modal is not enough.
+        if (hasKakaoChatComposer()) observedChat();
 
         scanning = true;
         scans++;
@@ -541,15 +543,17 @@ public class FishingAccessibilityService extends AccessibilityService {
                 closeFishingWebsite(text, image);
                 return;
             }
-            if (!inChat) {
-                if (isKakaoPhotoViewer(text)) {
-                    goBackFromTrustedView("카카오톡 사진 보기");
-                } else {
-                    status = "채팅이 아닌 화면 감지 → 안전 대기";
-                }
+            // The Kakao photo viewer can expose old chat edit fields
+            // behind its overlay. Positive viewer evidence takes priority.
+            if (isKakaoPhotoViewer(text, image.getHeight())) {
+                goBackFromTrustedView("카카오톡 사진 보기");
                 return;
             }
-            observedChat();
+            if (!inChat) {
+                status = "채팅이 아닌 화면 감지 → 안전 대기";
+                return;
+            }
+            if (hasKakaoChatComposer()) observedChat();
 
             recordVisualFrame(image);
             Target target = findFishing(text, image);
@@ -645,14 +649,20 @@ public class FishingAccessibilityService extends AccessibilityService {
     }
 
     /** Strong signal from the photo viewer screenshot, not arbitrary text. */
-    private boolean isKakaoPhotoViewer(Text recognized) {
+    private boolean isKakaoPhotoViewer(Text recognized, int screenHeight) {
         StringBuilder all = new StringBuilder();
-        for (Text.TextBlock b : recognized.getTextBlocks()) all.append(b.getText()).append(" ");
-        String normalized = all.toString().replace(" ", "");
-        return normalized.contains("AI로만들기")
-            && (normalized.contains("삭제") || normalized.contains("공유")
-                || normalized.contains("다운로드") || normalized.contains("오후")
-                || normalized.contains("오전"));
+        boolean topPhotoAction = false;
+        for (Text.TextBlock b : recognized.getTextBlocks()) {
+            String normalized = b.getText().replace(" ", "");
+            all.append(normalized).append(" ");
+            Rect bounds = b.getBoundingBox();
+            if (bounds != null && bounds.centerY() < screenHeight * .30
+                && normalized.contains("AI로만들기")) topPhotoAction = true;
+        }
+        String txt = all.toString();
+        return topPhotoAction && (txt.contains("오후") || txt.contains("오전")
+            || txt.contains("삭제") || txt.contains("공유")
+            || txt.contains("다운로드"));
     }
 
     /** Avoid interpreting a webpage text input as a Kakao message composer. */
@@ -667,8 +677,10 @@ public class FishingAccessibilityService extends AccessibilityService {
             AccessibilityNodeInfo node = queue.removeFirst();
             CharSequence label = node.getText();
             CharSequence desc = node.getContentDescription();
-            if ((label != null && label.toString().contains("메시지 입력"))
-                || (desc != null && desc.toString().contains("메시지 입력"))) return true;
+            if (node.isVisibleToUser() &&
+                ((label != null && label.toString().contains("메시지 입력"))
+                || (desc != null && desc.toString().contains("메시지 입력"))))
+                return true;
             for (int i = 0; i < node.getChildCount(); i++) {
                 AccessibilityNodeInfo child = node.getChild(i);
                 if (child != null) queue.add(child);
