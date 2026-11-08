@@ -121,6 +121,8 @@ public class MainActivity extends Activity {
             "• 카카오톡에서 열린 사진 뷰어도 뒤로가기로 복귀\n" +
             "• 복귀는 최근 카카오톡 채팅을 확인했을 때만, 최대 3회 시도\n" +
             "• 버튼이 없고 3초 이상 정지하면 이전 메시지에서 재탐색\n" +
+            "• 최신 낚시 버튼 우선: 화면에 여러 개 있으면 아래쪽 버튼을 선택\n" +
+            "• 옆 버튼 글자가 인식되지 않아도 두 회색 버튼과 가운데 흰 틈을 확인\n" +
             "• 실제 회색 낚시 버튼 + 옆 버튼(강화/대결/자랑하기)을 함께 확인\n" +
             "• 채팅 텍스트 '낚시'는 누르지 않음\n" +
             "• 하단 버튼이 입력창에 가려지면 채팅을 위로 스크롤 후 재탐색\n" +
@@ -205,6 +207,8 @@ public class MainActivity extends Activity {
                   service.getCancelledGestures() + "회\n" +
                   "하단 가림 복구 " + service.getRevealedBottomButtons() +
                   "회 · 텍스트 오인 차단 " + service.getBlockedTextCandidates() + "회\n" +
+                  "회색 2버튼 보조 인식 " + service.getVisualPairFallbacks() +
+                  "회 · 합쳐진 글자 인식 " + service.getMergedOcrPairs() + "회\n" +
                   "자동 멈춤 복구 " + service.getWatchdogRecoveries() + "회 · 마지막 간격 " +
                   service.getLastChosenTapIntervalMs() + "ms · 탐색 활동 " +
                   service.getLastProgressAgeSeconds() + "초 전\n" +
