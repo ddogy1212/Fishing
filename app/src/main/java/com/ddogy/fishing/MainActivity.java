@@ -130,7 +130,9 @@ public class MainActivity extends Activity {
             "• OCR 완료 이후에만 터치/스크롤 실행(서로 겹치지 않도록 직렬화)\n" +
             "• 스크롤이 완료되면 0.65초 안정화 후 재탐색\n" +
             "• 화면 상단의 낚시 버튼도 인식, 회색 버튼 후보가 있으면 스크롤보다 재인식 우선\n" +            "• 실제 회색 버튼 줄을 발견하면 해당 부분만 2배 확대해 OCR 재검사\n" +
-            "• 버튼 줄이 보이면 위아래 반복 스크롤 대신 글자 재인식\n" +
+            "• 회색 버튼 줄은 최대 6.5초만 재인식하고 실패 시 스크롤 복구\n" +
+            "• 물고기 도둑 이벤트는 낚시 버튼이 없으면 이전 메시지 탐색\n" +
+            "• 가려진 버튼 복구도 제한 횟수 이후에는 재탐색\n" +
 
             "• 12.5초 이상 작업 정지 시 독립 감시기가 자동 복구\n" +
             "• 다른 Fishing 버전 접근성 서비스가 켜져 있으면 중복 실행 방지\n" +
@@ -216,6 +218,8 @@ public class MainActivity extends Activity {
                   "회색 버튼 줄 " + service.getVerifiedGreyPairRows() +
                   "개 · 확대 OCR " + service.getFocusedOcrAttempts() +
                   "회 · 확대 성공 " + service.getFocusedOcrMatches() + "회\n" +
+                  "오인식 대기 복구 " + service.getBlockedGreyRowRecoveries() +
+                  "회 · 물고기 도둑 대응 " + service.getFishThiefRecoveries() + "회\n" +
                   "완료된 제스처 " + service.getSerializedGestures() +
                   "회 · OCR 후 대기 제스처 " + service.getDeferredGestureActions() + "회\n" +
                   "자동 멈춤 복구 " + service.getWatchdogRecoveries() + "회 · 마지막 간격 " +
