@@ -20,14 +20,14 @@ android {
     compileSdk 35
 
     defaultConfig {
-        applicationId freshInstall ? 'com.ddogy.fishing.fresh192' : 'com.ddogy.fishing'
+        applicationId freshInstall ? 'com.ddogy.fishing.fresh193' : 'com.ddogy.fishing'
         minSdk 30
         targetSdk 35
-        versionCode freshInstall ? 1 : 13
-        versionName '1.9.2'
+        versionCode freshInstall ? 1 : 14
+        versionName '1.9.3'
         manifestPlaceholders = [
-            appLabel: freshInstall ? 'Fishing 배낚시 1.9.2' : '@string/app_name',
-            accessibilityLabel: freshInstall ? 'Fishing 배낚시 1.9.2 도우미' : '@string/service_name'
+            appLabel: freshInstall ? 'Fishing 배낚시 1.9.3' : '@string/app_name',
+            accessibilityLabel: freshInstall ? 'Fishing 배낚시 1.9.3 도우미' : '@string/service_name'
         ]
     }
 
