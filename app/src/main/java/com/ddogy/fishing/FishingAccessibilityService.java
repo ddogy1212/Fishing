@@ -581,7 +581,7 @@ public class FishingAccessibilityService extends AccessibilityService {
         if (rect == null || rect.width() <= 6 || rect.height() <= 6) return best;
         int w = image.getWidth(), h = image.getHeight();
         int x = rect.centerX(), y = rect.centerY();
-        if (x <= w * .10 || x >= w * .91 || y <= h * .20 || y >= h * .91) return best;
+        if (x <= w * .10 || x >= w * .91 || y <= h * .14 || y >= h * .91) return best;
         if (!isGreyButton(image, rect)) return best;
         Target target = new Target(x, y, x < w / 2 ? "왼쪽" : "오른쪽");
         return best == null || best.y < target.y ? target : best;
@@ -607,7 +607,7 @@ public class FishingAccessibilityService extends AccessibilityService {
                 node.getBoundsInScreen(bounds);
                 if (bounds.width() > 10 && bounds.width() < w * .52
                     && bounds.height() > 10 && bounds.height() < h * .11
-                    && bounds.centerY() > h * .2 && bounds.centerY() < h * .91) {
+                    && bounds.centerY() > h * .14 && bounds.centerY() < h * .91) {
                     if ("낚시".equals(name) || "낚시".equals(description)) fish.add(bounds);
                     if ("대결".equals(name) || "강화".equals(name)
                         || "대결".equals(description) || "강화".equals(description)) {
