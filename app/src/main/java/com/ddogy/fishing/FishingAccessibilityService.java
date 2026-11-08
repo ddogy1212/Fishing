@@ -22,119 +22,81 @@ import com.google.mlkit.vision.text.TextRecognizer;
 import com.google.mlkit.vision.text.korean.KoreanTextRecognizerOptions;
 
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Random;
 
 /**
- * User-controlled, on-device fishing-button assistant.
- * Intentionally refuses to guess coordinates when OCR/popup evidence is weak.
+ * Minimal, on-device and user-controlled fishing button assistant.
+ * Only scans visible KakaoTalk chats and taps verified gray "낚시" buttons.
+ * No popup closing, swiping or background navigation.
  */
 public class FishingAccessibilityService extends AccessibilityService {
     public static volatile FishingAccessibilityService active;
 
-    private static final String KAKAO_PACKAGE = "com.kakao.talk";
-    private static final int MIN_INTERVAL_MS = 1800;
-    private static final int MAX_INTERVAL_MS = 2200;
+    private static final String KAKAO = "com.kakao.talk";
     private static final String PREFS = "fishing_settings";
-    private static final String WANTED = "user_requested_running";
-    private static final long SCAN_TIMEOUT_MS = 9000;
-    private static final long STALL_MS = 3000; // no meaningful screen change
-    private static final long RECOVERY_COOLDOWN_MS = 9000;
-    private static final long GESTURE_TIMEOUT_MS = 4000;
-    private static final long SWIPE_SETTLE_MS = 450;
-
+    private static final String USER_STARTED = "user_requested_running";
+    private static final int OCR_TIMEOUT_MS = 9000;
+    private static final int GESTURE_TIMEOUT_MS = 4000;
     private final Handler main = new Handler(Looper.getMainLooper());
     private final Random random = new Random();
     private final Runnable ticker = this::scanOnce;
 
-
     private TextRecognizer recognizer;
-    private boolean running = false;
-    private boolean working = false;
-    private boolean seenChat = false;
-    private boolean gestureBusy = false;
-    private boolean recovering = false;
-    private int gestureToken = 0;
-    private int sessionToken = 0;
-    private long gesturesCompleted = 0;
-    private long cancelledGestures = 0;
-    private long recoveryCount = 0;
-    private long lastRecoveryAt = -RECOVERY_COOLDOWN_MS;
-    private long lastVisualChangeAt = 0;
-    private int[] lastVisualSample;
-    private long clicks = 0;
-    private long lastTapAt = 0;
-    private int scanToken = 0;
-    private long scans = 0;
-    private long scanTimeouts = 0;
-    private long captureFailures = 0;
-    private long unmatchedScans = 0;
+    private boolean running;
+    private boolean scanning;
+    private boolean tapping;
+    private int scanToken;
+    private int gestureToken;
+    private long scans;
+    private long clicks;
+    private long failures;
+    private long missed;
+    private long cancelledGestures;
     private String status = "준비 완료";
 
-    private final Runnable gestureWatchdog = () -> {
-        if (!running || !gestureBusy) return;
-        // Even if Android drops a gesture callback, its 80–240 ms stroke
-        // cannot still be active several seconds later. Invalidate any
-        // delayed callback and recover the scanning loop.
-        gestureToken++;
-        gestureBusy = false;
-        recovering = false;
-        cancelledGestures++;
-        status = "제스처 응답 지연 → 안전 재탐색";
-        schedule(950);
-    };
-
-    private final Runnable watchdog = () -> {
-        if (!running || !working) return;
-        // OCR and screenshot callbacks do not have a guaranteed deadline.
-        // Discard stale callback work, then schedule a fresh scan.
+    private final Runnable scanTimeout = () -> {
+        if (!running || !scanning) return;
         scanToken++;
-        working = false;
-        scanTimeouts++;
-        status = "화면 인식 지연 복구 중 (" + scanTimeouts + "회)";
-        schedule(650);
+        scanning = false;
+        failures++;
+        status = "화면 인식 지연 → 다시 검사";
+        schedule(1100);
     };
 
-    @Override protected void onServiceConnected() {
+    private final Runnable tapTimeout = () -> {
+        if (!running || !tapping) return;
+        gestureToken++;
+        tapping = false;
+        cancelledGestures++;
+        status = "터치 응답 지연 → 다시 검사";
+        schedule(1200);
+    };
+
+    @Override public void onServiceConnected() {
         super.onServiceConnected();
         active = this;
-        recognizer = TextRecognition.getClient(new KoreanTextRecognizerOptions.Builder().build());
-        status = "준비 완료";
-        if (getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(WANTED, false)) {
-            // The process may be reclaimed without onDestroy. Resume only if
-            // the user had explicitly started a session earlier.
+        recognizer = TextRecognition.getClient(
+            new KoreanTextRecognizerOptions.Builder().build());
+        if (getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(USER_STARTED, false)) {
             running = true;
-            status = "이전 자동 낚시 세션 복원 중";
-            schedule(500);
+            status = "이전 실행 세션 복원 중";
+            schedule(600);
+        } else {
+            status = "시작 버튼을 눌러 주세요";
         }
     }
 
     @Override public void onAccessibilityEvent(AccessibilityEvent event) {
-        // Never automatically start or acquire additional app permissions.
+        // Never trigger an extra tap just because KakaoTalk sends an event.
     }
 
     @Override public void onInterrupt() {
-        // A temporary accessibility interruption is NOT an explicit user stop.
-        // The next scan will re-check the foreground app before any tap.
-        if (running) {
-            status = "접근성 일시 중단 — 자동 복구 확인 중";
-            if (!working) schedule(800);
-        }
+        if (running && !scanning && !tapping) schedule(900);
     }
 
     @Override public void onDestroy() {
-        running = false;
-        working = false;
-        scanToken++;
-        main.removeCallbacks(ticker);
-        main.removeCallbacks(watchdog);
-        main.removeCallbacks(gestureWatchdog);
-        gestureBusy = false;
-        recovering = false;
-        gestureToken++;
-        sessionToken++;
-        // A deliberate accessibility-service shutdown must not secretly
-        // restart automation when the permission is re-enabled later.
-        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean(WANTED, false).apply();
+        stopRunning();
         if (recognizer != null) recognizer.close();
         if (active == this) active = null;
         super.onDestroy();
@@ -142,309 +104,175 @@ public class FishingAccessibilityService extends AccessibilityService {
 
     public void startRunning() {
         if (running) return;
-        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean(WANTED, true).apply();
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+            .putBoolean(USER_STARTED, true).apply();
         running = true;
-        working = false;
-        seenChat = false;
+        scanning = false;
+        tapping = false;
         scanToken++;
-        lastTapAt = 0;
-        lastVisualSample = null;
-        lastVisualChangeAt = 0;
-        lastRecoveryAt = -RECOVERY_COOLDOWN_MS;
-        gestureBusy = false;
-        recovering = false;
         gestureToken++;
-        sessionToken++;
-        main.removeCallbacks(gestureWatchdog);
-        status = "카카오톡 낚시 채팅 화면으로 이동하세요";
-        schedule(300);
+        status = "카카오톡 낚시 채팅방으로 이동하세요";
+        schedule(450);
     }
 
     public void stopRunning() {
-        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean(WANTED, false).apply();
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+            .putBoolean(USER_STARTED, false).apply();
         running = false;
-        working = false;
+        scanning = false;
+        tapping = false;
         scanToken++;
-        main.removeCallbacks(ticker);
-        main.removeCallbacks(watchdog);
-        main.removeCallbacks(gestureWatchdog);
-        gestureBusy = false;
-        recovering = false;
         gestureToken++;
-        sessionToken++;
-        lastVisualSample = null;
-        lastVisualChangeAt = 0;
-        status = "사용자가 중지했습니다";
+        main.removeCallbacks(ticker);
+        main.removeCallbacks(scanTimeout);
+        main.removeCallbacks(tapTimeout);
+        status = "중지됨";
     }
 
     public boolean isRunning() { return running; }
     public long getClickCount() { return clicks; }
     public long getScans() { return scans; }
-    public long getTimeouts() { return scanTimeouts; }
-    public long getCaptureFailures() { return captureFailures; }
-    public long getUnmatchedScans() { return unmatchedScans; }
-    public long getRecoveryCount() { return recoveryCount; }
+    public long getTimeouts() { return failures; }
+    public long getCaptureFailures() { return failures; }
+    public long getUnmatchedScans() { return missed; }
+    public long getRecoveryCount() { return 0; }
     public long getCancelledGestures() { return cancelledGestures; }
     public String getCurrentStatus() { return status; }
 
-    private void schedule(long ms) {
+    private void schedule(long delayMs) {
         main.removeCallbacks(ticker);
-        if (running && !gestureBusy && !recovering) main.postDelayed(ticker, ms);
+        if (running && !scanning && !tapping) main.postDelayed(ticker, delayMs);
     }
 
-    private long nextDelay() {
-        // Respect the requested 1.8–2.2 second *tap* interval when possible.
-        return MIN_INTERVAL_MS + random.nextInt(MAX_INTERVAL_MS - MIN_INTERVAL_MS + 1);
-    }
+    private boolean visibleKakaoChat() {
+        AccessibilityNodeInfo root = getRootInActiveWindow();
+        if (root == null || root.getPackageName() == null
+            || !KAKAO.contentEquals(root.getPackageName())) return false;
 
-    private void nextCycle() {
-        long nextTarget = lastTapAt == 0 ? 0 : lastTapAt + nextDelay();
-        long wait = Math.max(250, nextTarget - SystemClock.uptimeMillis());
-        schedule(wait);
+        ArrayDeque<AccessibilityNodeInfo> queue = new ArrayDeque<>();
+        queue.add(root);
+        int visited = 0;
+        while (!queue.isEmpty() && visited++ < 500) {
+            AccessibilityNodeInfo node = queue.removeFirst();
+            CharSequence label = node.getText();
+            CharSequence desc = node.getContentDescription();
+            if (node.isEditable()
+                || (label != null && label.toString().contains("메시지 입력"))
+                || (desc != null && desc.toString().contains("메시지 입력"))) return true;
+            for (int i = 0; i < node.getChildCount(); i++) {
+                AccessibilityNodeInfo child = node.getChild(i);
+                if (child != null) queue.add(child);
+            }
+        }
+        return false;
     }
 
     private void scanOnce() {
-        if (!running || working || gestureBusy || recovering) return;
-
-        AccessibilityNodeInfo root = getRootInActiveWindow();
-        if (root == null || root.getPackageName() == null
-                || !KAKAO_PACKAGE.contentEquals(root.getPackageName())) {
-            status = "카카오톡 화면을 기다리고 있어요";
-            schedule(900);
+        if (!running || scanning || tapping) return;
+        if (!visibleKakaoChat()) {
+            status = "카카오톡 채팅 화면 대기 중";
+            schedule(950);
             return;
         }
 
-        working = true;
+        scanning = true;
         scans++;
-        int token = ++scanToken;
-        main.removeCallbacks(watchdog);
-        main.postDelayed(watchdog, SCAN_TIMEOUT_MS);
-        boolean chatComposer = containsChatComposer(root);
+        final int id = ++scanToken;
+        main.removeCallbacks(scanTimeout);
+        main.postDelayed(scanTimeout, OCR_TIMEOUT_MS);
         try {
             takeScreenshot(Display.DEFAULT_DISPLAY, getMainExecutor(),
                 new TakeScreenshotCallback() {
-                    @Override public void onSuccess(ScreenshotResult shot) {
-                        HardwareBuffer buffer = shot.getHardwareBuffer();
-                        if (!running || token != scanToken) {
-                            if (buffer != null) buffer.close();
-                            return;
-                        }
+                    @Override public void onSuccess(ScreenshotResult screenshot) {
+                        HardwareBuffer buffer = screenshot.getHardwareBuffer();
                         Bitmap copy = null;
                         try {
-                            Bitmap hardware = Bitmap.wrapHardwareBuffer(buffer, shot.getColorSpace());
+                            if (!running || id != scanToken) return;
+                            Bitmap hardware = Bitmap.wrapHardwareBuffer(
+                                buffer, screenshot.getColorSpace());
                             if (hardware != null) {
                                 copy = hardware.copy(Bitmap.Config.ARGB_8888, false);
                                 hardware.recycle();
                             }
-                        } catch (Exception e) {
-                            status = "화면 가져오기 실패: " + e.getClass().getSimpleName();
+                        } catch (Exception error) {
+                            status = "화면 복사 실패 → 다시 검사";
                         } finally {
                             if (buffer != null) buffer.close();
                         }
                         if (copy == null) {
-                            captureFailures++;
-                            finishScan(token, 1100);
+                            if (running && id == scanToken) {
+                                failures++;
+                                finishScan(id, 1200);
+                            }
                             return;
                         }
-                        analyze(copy, chatComposer, token);
+                        recognize(copy, id);
                     }
 
                     @Override public void onFailure(int errorCode) {
-                        if (!running || token != scanToken) return;
-                        captureFailures++;
-                        status = "화면 캡처 실패 (" + errorCode + ") — 재시도";
-                        finishScan(token, 1150);
+                        if (!running || id != scanToken) return;
+                        failures++;
+                        status = "화면 캡처 실패 (" + errorCode + ")";
+                        finishScan(id, 1200);
                     }
                 });
         } catch (Exception e) {
-            captureFailures++;
-            status = "스크린샷 예외 — 재시도";
-            finishScan(token, 1200);
+            failures++;
+            status = "화면 인식 예외 → 재시도";
+            finishScan(id, 1200);
         }
     }
 
-    private void finishScan(int token, long retryWait) {
-        if (token != scanToken) return;
-        working = false;
-        main.removeCallbacks(watchdog);
-        if (running && !gestureBusy && !recovering) {
-            if (retryWait > 0) schedule(retryWait);
-            else nextCycle();
-        }
-    }
-
-    private void analyze(Bitmap frame, boolean chatComposer, int token) {
+    private void recognize(Bitmap image, int id) {
         Task<Text> task;
         try {
-            task = recognizer.process(InputImage.fromBitmap(frame, 0));
-        } catch (Exception e) {
-            frame.recycle();
-            status = "문자 인식 시작 실패 — 재시도";
-            finishScan(token, 1150);
+            task = recognizer.process(InputImage.fromBitmap(image, 0));
+        } catch (Exception error) {
+            image.recycle();
+            failures++;
+            finishScan(id, 1200);
             return;
         }
 
-        task.addOnSuccessListener(result -> {
-            if (!running || token != scanToken) return;
-            // Observe the chat region BEFORE performing any gesture. This
-            // catches lost taps: we still recover if taps were dispatched
-            // but the visual screen stayed unchanged for 3 seconds.
-            recordVisualChange(frame);
-            Target fishing = findFishing(result, frame);
-            // Accessibility nodes are a backup when OCR misses the '낚시' text.
-            if (fishing == null) fishing = findFishingFromAccessibility(frame);
-
-            // Check the popup close button before potentially tapping a
-            // still-visible old fishing card underneath a popup.
-            if (seenChat && !chatComposer) {
-                Target close = findCloseFromAccessibility(frame.getWidth(), frame.getHeight());
-                if (close == null) close = findCloseFromOcr(result, frame);
-                if (close == null) close = findCloseFromPixels(frame);
-                if (close != null) {
-                    status = "팝업 닫기(X) → 채팅 복귀";
-                    tap(close.x, close.y, false);
-                    return;
-                }
+        task.addOnSuccessListener(text -> {
+            if (!running || id != scanToken) return;
+            Target target = findFishing(text, image);
+            if (target == null) target = findFishingFromNodes(image);
+            if (target != null && visibleKakaoChat()) {
+                status = "낚시 버튼 인식 (" + target.side + ") → 클릭";
+                tap(target.x, target.y);
+            } else {
+                missed++;
+                status = "'낚시' 버튼 탐색 중";
             }
-
-            if (fishing != null) seenChat = true;
-
-            // Refresh the chat viewport only when a real chat was previously
-            // seen, the composer is visible, and the *screen* is stalled.
-            // Do not mix scroll gestures with fishing taps.
-            if (seenChat && chatComposer && shouldRecover()) {
-                beginRecovery(frame.getWidth(), frame.getHeight());
-                return;
+        }).addOnFailureListener(error -> {
+            if (running && id == scanToken) {
+                failures++;
+                status = "한글 인식 실패 → 재시도";
             }
-
-            if (fishing != null) {
-                status = "낚시 버튼 인식 (" + fishing.side + ") — 터치";
-                tap(fishing.x, fishing.y, true);
-                return;
-            }
-
-            unmatchedScans++;
-            status = seenChat && !chatComposer
-                ? "팝업 의심: X 확인 불가, 재탐색 (" + unmatchedScans + ")"
-                : "'낚시' 버튼 다시 탐색 중 (" + unmatchedScans + "회)";
-        }).addOnFailureListener(e -> {
-            if (running && token == scanToken)
-                status = "한글 인식 실패 — 안전하게 재시도";
         }).addOnCompleteListener(t -> {
-            if (!frame.isRecycled()) frame.recycle();
-            finishScan(token, 0);
+            if (!image.isRecycled()) image.recycle();
+            finishScan(id, 850);
         });
     }
 
-    /**
-     * Track meaningful visual movement in the central chat area. Ignore the
-     * status bar, input caret, and most transient top/bottom UI elements.
-     * No screenshots or text are retained; only low-resolution color samples.
-     */
-    private void recordVisualChange(Bitmap frame) {
-        int w = frame.getWidth(), h = frame.getHeight();
-        int[] sample = new int[10 * 13];
-        int n = 0;
-        for (int iy = 0; iy < 13; iy++) {
-            int y = (int)(h * (0.26 + 0.55 * (iy + .5) / 13.0));
-            for (int ix = 0; ix < 10; ix++) {
-                int x = (int)(w * (0.12 + 0.76 * (ix + .5) / 10.0));
-                sample[n++] = frame.getPixel(x, y) & 0xFFFFFF;
-            }
-        }
-        long now = SystemClock.uptimeMillis();
-        boolean changed = lastVisualSample == null;
-        if (lastVisualSample != null) {
-            int changedPixels = 0;
-            for (int i = 0; i < sample.length; i++) {
-                int a = sample[i], b = lastVisualSample[i];
-                int difference = (Math.abs(Color.red(a) - Color.red(b))
-                    + Math.abs(Color.green(a) - Color.green(b))
-                    + Math.abs(Color.blue(a) - Color.blue(b))) / 3;
-                if (difference >= 20) changedPixels++;
-            }
-            changed = changedPixels >= 4;
-        }
-        if (changed || lastVisualChangeAt == 0) lastVisualChangeAt = now;
-        lastVisualSample = sample;
+    private void finishScan(int id, long delayMs) {
+        if (id != scanToken) return;
+        scanning = false;
+        main.removeCallbacks(scanTimeout);
+        schedule(delayMs);
     }
 
-    private boolean shouldRecover() {
-        long now = SystemClock.uptimeMillis();
-        return !gestureBusy
-            && lastVisualChangeAt > 0
-            && now - lastVisualChangeAt >= STALL_MS
-            && now - lastRecoveryAt >= RECOVERY_COOLDOWN_MS;
-    }
-
-    /**
-     * Scroll just enough to force re-layout of the chat, then reverse the
-     * scroll in a separate completed gesture. The chat input must be visible;
-     * a popup or another app never triggers this operation.
-     */
-    private void beginRecovery(int w, int h) {
-        if (!running || gestureBusy || recovering || !isKakaoChat()) return;
-        recovering = true;
-        int session = sessionToken;
-        lastRecoveryAt = SystemClock.uptimeMillis();
-        recoveryCount++;
-        int x = Math.round(w * .80f);
-        int centerY = Math.round(h * .54f);
-        int delta = Math.max(110, Math.min(170, Math.round(h * .11f)));
-        int upperY = centerY - delta / 2;
-        int lowerY = centerY + delta / 2;
-        status = "화면 3초 정지 → 위로 스크롤 (" + recoveryCount + ")";
-        swipe(x, lowerY, upperY, () -> {
-            if (!running || session != sessionToken) return;
-            main.postDelayed(() -> {
-                if (!running || session != sessionToken || gestureBusy) return;
-                if (!isKakaoChat()) {
-                    recovering = false;
-                    schedule(900);
-                    return;
-                }
-                status = "스크롤 완료 → 아래로 복귀";
-                swipe(x, upperY, lowerY, () -> {
-                    if (session != sessionToken) return;
-                    recovering = false;
-                    lastVisualSample = null; // fresh baseline after returning
-                    lastVisualChangeAt = SystemClock.uptimeMillis();
-                    status = "스크롤 복귀 완료 → 낚시 버튼 재인식";
-                    schedule(550);
-                });
-            }, SWIPE_SETTLE_MS);
-        });
-    }
-
-    private boolean isKakaoChat() {
-        AccessibilityNodeInfo root = getRootInActiveWindow();
-        return root != null && root.getPackageName() != null
-            && KAKAO_PACKAGE.contentEquals(root.getPackageName())
-            && containsChatComposer(root);
-    }
-
-    private void swipe(int x, int fromY, int toY, Runnable onCompleted) {
-        Path path = new Path();
-        path.moveTo(x, fromY);
-        path.lineTo(x, toY);
-        dispatchSingleGesture(path, 240, false, onCompleted);
-    }
-
-    /** The OCR *element* must exactly be 낚시, not a larger message like 낚시터. */
-    private Target findFishing(Text text, Bitmap frame) {
+    private Target findFishing(Text result, Bitmap image) {
         Target best = null;
-        int w = frame.getWidth(), h = frame.getHeight();
-
-        for (Text.TextBlock block : text.getTextBlocks()) {
+        for (Text.TextBlock block : result.getTextBlocks()) {
             for (Text.Line line : block.getLines()) {
-                // ML Kit sometimes combines/splits the characters across
-                // elements. Checking the full line catches these cases.
-                if ("낚시".equals(line.getText().replaceAll("[^가-힣]", ""))) {
-                    best = chooseFishingRect(frame, line.getBoundingBox(), best);
+                if (isFishing(line.getText())) {
+                    best = choose(image, line.getBoundingBox(), best);
                 }
-                for (Text.Element element : line.getElements()) {
-                    if ("낚시".equals(element.getText().replaceAll("[^가-힣]", ""))) {
-                        best = chooseFishingRect(frame, element.getBoundingBox(), best);
+                for (Text.Element word : line.getElements()) {
+                    if (isFishing(word.getText())) {
+                        best = choose(image, word.getBoundingBox(), best);
                     }
                 }
             }
@@ -452,311 +280,141 @@ public class FishingAccessibilityService extends AccessibilityService {
         return best;
     }
 
-    private Target chooseFishingRect(Bitmap frame, Rect r, Target best) {
-        if (r == null || r.width() <= 6 || r.height() <= 6) return best;
-        int w = frame.getWidth(), h = frame.getHeight();
-        int cx = r.centerX(), cy = r.centerY();
-        if (cy < h * 0.20 || cy > h * 0.91) return best;
-        if (cx < w * 0.11 || cx > w * 0.90) return best;
-        if (!looksLikeGreyButton(frame, r)) return best;
-        if (best == null || cy > best.y)
-            return new Target(cx, cy, cx < w / 2 ? "왼쪽" : "오른쪽");
-        return best;
+    private boolean isFishing(String raw) {
+        return "낚시".equals(raw.replaceAll("[^가-힣]", ""));
     }
 
-    /**
-     * Fallback for WebView/Chat UI buttons exposed through accessibility,
-     * even if on-device OCR misses their characters. Requires a same-row
-     * companion labeled '대결' or '강화'; no arbitrary coordinate guessing.
-     */
-    private Target findFishingFromAccessibility(Bitmap frame) {
+    private Target choose(Bitmap image, Rect rect, Target best) {
+        if (rect == null || rect.width() <= 6 || rect.height() <= 6) return best;
+        int w = image.getWidth(), h = image.getHeight();
+        int x = rect.centerX(), y = rect.centerY();
+        if (x <= w * .10 || x >= w * .91 || y <= h * .20 || y >= h * .91) return best;
+        if (!isGreyButton(image, rect)) return best;
+        Target target = new Target(x, y, x < w / 2 ? "왼쪽" : "오른쪽");
+        return best == null || best.y < target.y ? target : best;
+    }
+
+    private Target findFishingFromNodes(Bitmap image) {
         AccessibilityNodeInfo root = getRootInActiveWindow();
         if (root == null || root.getPackageName() == null
-            || !KAKAO_PACKAGE.contentEquals(root.getPackageName())) return null;
+            || !KAKAO.contentEquals(root.getPackageName())) return null;
 
-        ArrayDeque<AccessibilityNodeInfo> todo = new ArrayDeque<>();
-        java.util.ArrayList<Rect> fishing = new java.util.ArrayList<>();
-        java.util.ArrayList<Rect> peers = new java.util.ArrayList<>();
-        todo.add(root);
-        int visited = 0, w = frame.getWidth(), h = frame.getHeight();
-        while (!todo.isEmpty() && visited++ < 1000) {
-            AccessibilityNodeInfo node = todo.removeFirst();
+        ArrayDeque<AccessibilityNodeInfo> queue = new ArrayDeque<>();
+        ArrayList<Rect> fish = new ArrayList<>();
+        ArrayList<Rect> neighbor = new ArrayList<>();
+        queue.add(root);
+        int w = image.getWidth(), h = image.getHeight(), count = 0;
+        while (!queue.isEmpty() && count++ < 900) {
+            AccessibilityNodeInfo node = queue.removeFirst();
             if (node.isVisibleToUser()) {
-                String value = node.getText() == null ? "" : node.getText().toString().trim();
-                String desc = node.getContentDescription() == null ? ""
+                String name = node.getText() == null ? "" : node.getText().toString().trim();
+                String description = node.getContentDescription() == null ? ""
                     : node.getContentDescription().toString().trim();
                 Rect bounds = new Rect();
                 node.getBoundsInScreen(bounds);
                 if (bounds.width() > 10 && bounds.width() < w * .52
                     && bounds.height() > 10 && bounds.height() < h * .11
-                    && bounds.centerX() > w * .10 && bounds.centerX() < w * .91
-                    && bounds.centerY() > h * .20 && bounds.centerY() < h * .91) {
-                    if ("낚시".equals(value) || "낚시".equals(desc))
-                        fishing.add(bounds);
-                    if ("대결".equals(value) || "강화".equals(value)
-                        || "대결".equals(desc) || "강화".equals(desc))
-                        peers.add(bounds);
+                    && bounds.centerY() > h * .2 && bounds.centerY() < h * .91) {
+                    if ("낚시".equals(name) || "낚시".equals(description)) fish.add(bounds);
+                    if ("대결".equals(name) || "강화".equals(name)
+                        || "대결".equals(description) || "강화".equals(description)) {
+                        neighbor.add(bounds);
+                    }
                 }
             }
             for (int i = 0; i < node.getChildCount(); i++) {
                 AccessibilityNodeInfo child = node.getChild(i);
-                if (child != null) todo.addLast(child);
+                if (child != null) queue.add(child);
             }
         }
 
         Target best = null;
-        for (Rect r : fishing) {
+        for (Rect r : fish) {
             boolean paired = false;
-            for (Rect peer : peers) {
-                int dy = Math.abs(peer.centerY() - r.centerY());
-                int dx = Math.abs(peer.centerX() - r.centerX());
-                if (dy <= Math.max(24, h * .02) && dx > 45 && dx < w * .55) {
+            for (Rect q : neighbor) {
+                if (Math.abs(q.centerY() - r.centerY()) < Math.max(24, h * .025)
+                    && Math.abs(q.centerX() - r.centerX()) > 45) {
                     paired = true;
                     break;
                 }
             }
-            if (paired && looksLikeGreyButton(frame, r)) {
+            if (paired && isGreyButton(image, r)) {
                 Target t = new Target(r.centerX(), r.centerY(),
-                    r.centerX() < w / 2 ? "왼쪽 (접근성)" : "오른쪽 (접근성)");
+                    r.centerX() < w / 2 ? "왼쪽" : "오른쪽");
                 if (best == null || t.y > best.y) best = t;
             }
         }
         return best;
     }
 
-    /** Check an actual grey rounded-button background around the OCR letters. */
-    private boolean looksLikeGreyButton(Bitmap frame, Rect letters) {
-        int cx = letters.centerX(), cy = letters.centerY();
-        // OCR gives narrow text bounds, while accessibility sometimes gives
-        // the entire wide button. Sample *inside* either kind of bounds.
-        int gapX = letters.width() > 95
-            ? Math.min(52, letters.width() / 4)
-            : Math.max(letters.width(), Math.round(letters.height() * 1.25f));
-        int gapY = letters.height() > 48
-            ? Math.max(12, letters.height() / 4)
-            : Math.max(10, Math.round(letters.height() * 0.83f));
-        int matched = 0;
-
-        if (grey(frame, cx - gapX, cy)) matched++;
-        if (grey(frame, cx + gapX, cy)) matched++;
-        if (grey(frame, cx, cy - gapY)) matched++;
-        if (grey(frame, cx, cy + gapY)) matched++;
-        return matched >= 3;
+    private boolean isGreyButton(Bitmap image, Rect bounds) {
+        int x = bounds.centerX(), y = bounds.centerY();
+        int dx = bounds.width() > 95 ? Math.min(52, bounds.width() / 4)
+            : Math.max(bounds.width(), Math.round(bounds.height() * 1.25f));
+        int dy = bounds.height() > 48 ? Math.max(12, bounds.height() / 4)
+            : Math.max(10, Math.round(bounds.height() * .83f));
+        int matches = 0;
+        if (grey(image, x - dx, y)) matches++;
+        if (grey(image, x + dx, y)) matches++;
+        if (grey(image, x, y - dy)) matches++;
+        if (grey(image, x, y + dy)) matches++;
+        return matches >= 3;
     }
 
-    private boolean grey(Bitmap bmp, int x, int y) {
-        if (x < 1 || y < 1 || x >= bmp.getWidth()-1 || y >= bmp.getHeight()-1) return false;
-        int c = bmp.getPixel(x, y);
+    private boolean grey(Bitmap image, int x, int y) {
+        if (x < 1 || y < 1 || x >= image.getWidth() - 1
+            || y >= image.getHeight() - 1) return false;
+        int c = image.getPixel(x, y);
         int r = Color.red(c), g = Color.green(c), b = Color.blue(c);
-        return r >= 211 && r <= 250 && Math.abs(r-g) <= 13 && Math.abs(r-b) <= 13;
+        return r >= 211 && r <= 250 && Math.abs(r - g) <= 13 && Math.abs(r - b) <= 13;
     }
 
-    private boolean containsChatComposer(AccessibilityNodeInfo root) {
-        ArrayDeque<AccessibilityNodeInfo> queue = new ArrayDeque<>();
-        queue.add(root);
-        int n = 0;
-        while (!queue.isEmpty() && n++ < 350) {
-            AccessibilityNodeInfo node = queue.removeFirst();
-            CharSequence text = node.getText();
-            CharSequence desc = node.getContentDescription();
-            if (node.isEditable()
-                || (text != null && text.toString().contains("메시지 입력"))
-                || (desc != null && desc.toString().contains("메시지 입력"))) {
-                return true;
-            }
-            for (int j = 0; j < node.getChildCount(); j++) {
-                AccessibilityNodeInfo child = node.getChild(j);
-                if (child != null) queue.addLast(child);
-            }
-        }
-        return false;
-    }
-
-    /** Prefer an actual accessible close control in the popup's top left. */
-    private Target findCloseFromAccessibility(int w, int h) {
-        AccessibilityNodeInfo root = getRootInActiveWindow();
-        if (root == null || root.getPackageName() == null
-                || !KAKAO_PACKAGE.contentEquals(root.getPackageName())) return null;
-
-        ArrayDeque<AccessibilityNodeInfo> nodes = new ArrayDeque<>();
-        nodes.add(root);
-        int visited = 0;
-        while (!nodes.isEmpty() && visited++ < 400) {
-            AccessibilityNodeInfo node = nodes.removeFirst();
-            CharSequence t = node.getText();
-            CharSequence d = node.getContentDescription();
-            String value = ((t == null ? "" : t.toString()) + " " +
-                    (d == null ? "" : d.toString())).trim().toLowerCase();
-            Rect r = new Rect();
-            node.getBoundsInScreen(r);
-            boolean topLeft = r.centerX() > 5 && r.centerX() < w * 0.29
-                    && r.centerY() > h * 0.025 && r.centerY() < h * 0.30
-                    && r.width() < w * 0.35 && r.height() < h * 0.13;
-            if (topLeft && node.isVisibleToUser()
-                    && (value.equals("x") || value.equals("×") || value.equals("✕")
-                    || value.equals("닫기") || value.contains("닫기 버튼")
-                    || value.equals("close") || value.equals("close button"))) {
-                return new Target(r.centerX(), r.centerY(), "닫기");
-            }
-            for (int j = 0; j < node.getChildCount(); j++) {
-                AccessibilityNodeInfo child = node.getChild(j);
-                if (child != null) nodes.addLast(child);
-            }
-        }
-        return null;
-    }
-
-    /** OCR fallback: only a standalone X near the top-left of a confirmed popup. */
-    private Target findCloseFromOcr(Text text, Bitmap bmp) {
-        int w = bmp.getWidth(), h = bmp.getHeight();
-        for (Text.TextBlock block : text.getTextBlocks()) {
-            for (Text.Line line : block.getLines()) {
-                for (Text.Element element : line.getElements()) {
-                    String word = element.getText().trim();
-                    Rect r = element.getBoundingBox();
-                    if (r == null) continue;
-                    if (r.centerX() > 8 && r.centerX() < w * .29
-                        && r.centerY() > h * .025 && r.centerY() < h * .30
-                        && r.width() < w * .11 && r.height() < h * .10
-                        && (word.equals("X") || word.equals("×") || word.equals("✕")
-                            || word.equals("닫기"))) {
-                        return new Target(r.centerX(), r.centerY(), "OCR 닫기");
-                    }
-                }
-            }
-        }
-        return null;
-    }
-
-    /**
-     * Last resort for a graphic-only X icon which accessibility/OCR cannot read.
-     * Detect a high-contrast TWO-diagonal cross; a back arrow does not qualify.
-     * Restricted to the top-left corner and only used after a chat was seen.
-     */
-    private Target findCloseFromPixels(Bitmap bmp) {
-        int w = bmp.getWidth(), h = bmp.getHeight();
-        int bestScore = 0, bestX = -1, bestY = -1;
-        int fromX = Math.max(15, Math.round(w * .015f));
-        int toX = Math.min(Math.round(w * .24f), 180);
-        int fromY = Math.round(h * .045f);
-        int toY = Math.round(h * .235f);
-
-        for (int y = fromY; y < toY; y += 4) {
-            for (int x = fromX; x < toX; x += 4) {
-                int matched = 0, sumScore = 0, sign = 0;
-                for (int radius : new int[]{5, 8, 11}) {
-                    if (x - radius < 0 || x + radius >= w ||
-                            y - radius < 0 || y + radius >= h) continue;
-
-                    int diag = (light(bmp, x-radius, y-radius)
-                        + light(bmp, x+radius, y+radius)
-                        + light(bmp, x-radius, y+radius)
-                        + light(bmp, x+radius, y-radius)) / 4;
-                    int cardinal = (light(bmp, x-radius, y)
-                        + light(bmp, x+radius, y)
-                        + light(bmp, x, y-radius)
-                        + light(bmp, x, y+radius)) / 4;
-                    int delta = diag - cardinal;
-                    if (Math.abs(delta) >= 52 && (sign == 0 || (delta > 0 ? 1 : -1) == sign)) {
-                        matched++;
-                        sumScore += Math.abs(delta);
-                        sign = delta > 0 ? 1 : -1;
-                    }
-                }
-                if (matched >= 3 && sumScore > bestScore) {
-                    bestScore = sumScore;
-                    bestX = x;
-                    bestY = y;
-                }
-            }
-        }
-        return bestScore >= 190 ? new Target(bestX, bestY, "그림 X") : null;
-    }
-
-    private int light(Bitmap bmp, int x, int y) {
-        int c = bmp.getPixel(x, y);
-        return (Color.red(c) * 3 + Color.green(c) * 6 + Color.blue(c)) / 10;
-    }
-
-    private void tap(int x, int y, boolean fishing) {
+    private void tap(int x, int y) {
+        if (!running || tapping || !visibleKakaoChat()) return;
+        final int id = ++gestureToken;
+        tapping = true;
         Path path = new Path();
         path.moveTo(x, y);
-        dispatchSingleGesture(path, 80, fishing, null);
-    }
-
-    /**
-     * Serialize all taps and scrolls. An earlier gesture MUST complete before
-     * another starts. This prevents Android cancelling one overlapping stroke.
-     */
-    private void dispatchSingleGesture(Path path, long durationMs,
-            boolean fishingTap, Runnable continuation) {
-        if (!running || gestureBusy) return;
-        AccessibilityNodeInfo root = getRootInActiveWindow();
-        if (root == null || root.getPackageName() == null
-                || !KAKAO_PACKAGE.contentEquals(root.getPackageName())) {
-            // Accessibility window may change between chat confirmation
-            // and dispatch. Never leave the recovery state stuck.
-            if (recovering) {
-                recovering = false;
-                status = "채팅 화면 변경 감지 → 재확인";
-                schedule(900);
-            }
-            return;
-        }
-
-        int id = ++gestureToken;
-        gestureBusy = true;
-        main.removeCallbacks(ticker);
         GestureDescription gesture = new GestureDescription.Builder()
-            .addStroke(new GestureDescription.StrokeDescription(path, 0, durationMs)).build();
+            .addStroke(new GestureDescription.StrokeDescription(path, 0, 80))
+            .build();
         try {
-            boolean dispatched = dispatchGesture(gesture, new GestureResultCallback() {
-                @Override public void onCompleted(GestureDescription gd) {
+            boolean accepted = dispatchGesture(gesture, new GestureResultCallback() {
+                @Override public void onCompleted(GestureDescription value) {
                     if (id != gestureToken) return;
-                    gestureBusy = false;
-                    main.removeCallbacks(gestureWatchdog);
-                    gesturesCompleted++;
-                    if (!running) return;
-                    if (fishingTap) {
-                        lastTapAt = SystemClock.uptimeMillis();
+                    tapping = false;
+                    main.removeCallbacks(tapTimeout);
+                    if (running) {
                         clicks++;
-                        status = "낚시 터치 완료 → 다음 인식 대기";
-                    } else if (continuation == null) {
-                        lastTapAt = SystemClock.uptimeMillis();
-                        status = "팝업 닫기 완료 → 재탐색";
+                        status = "낚시 터치 완료 · 다음 버튼 기다리는 중";
+                        schedule(1800 + random.nextInt(401));
                     }
-                    if (continuation != null) continuation.run();
-                    else nextCycle();
                 }
 
-                @Override public void onCancelled(GestureDescription gd) {
+                @Override public void onCancelled(GestureDescription value) {
                     if (id != gestureToken) return;
-                    gestureBusy = false;
-                    main.removeCallbacks(gestureWatchdog);
+                    tapping = false;
                     cancelledGestures++;
-                    recovering = false;
+                    main.removeCallbacks(tapTimeout);
                     if (running) {
-                        status = "제스처 취소됨 — 재탐색 (" + cancelledGestures + ")";
-                        schedule(900);
+                        status = "터치 취소됨 → 다시 검사";
+                        schedule(1100);
                     }
                 }
             }, main);
-            if (!dispatched) {
-                gestureBusy = false;
-                recovering = false;
-                cancelledGestures++;
-                status = "제스처 전송 실패 — 재시도";
-                schedule(850);
+            if (accepted) {
+                main.removeCallbacks(tapTimeout);
+                main.postDelayed(tapTimeout, GESTURE_TIMEOUT_MS);
             } else {
-                main.removeCallbacks(gestureWatchdog);
-                main.postDelayed(gestureWatchdog, GESTURE_TIMEOUT_MS);
+                tapping = false;
+                cancelledGestures++;
+                schedule(950);
             }
-        } catch (Exception e) {
-            gestureBusy = false;
-            recovering = false;
+        } catch (Exception error) {
+            tapping = false;
             cancelledGestures++;
-            status = "제스처 예외 — 재시도";
-            schedule(1000);
+            status = "터치 실패 → 다시 검사";
+            schedule(1050);
         }
     }
 
@@ -764,7 +422,9 @@ public class FishingAccessibilityService extends AccessibilityService {
         final int x, y;
         final String side;
         Target(int x, int y, String side) {
-            this.x = x; this.y = y; this.side = side;
+            this.x = x;
+            this.y = y;
+            this.side = side;
         }
     }
 }
